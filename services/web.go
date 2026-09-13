@@ -112,7 +112,11 @@ func ParseNames(q string) []string {
 // sourceCacheTTL is how long a parsed source track is reused. A client
 // polls the same URL every few seconds while the job runs, and the source
 // does not change between polls.
-const sourceCacheTTL = 10 * time.Minute
+const (
+	sourceCacheTTL      = 10 * time.Minute
+	sourceCacheCapacity = 64
+	sourceFetchTimeout  = 30 * time.Second
+)
 
 type Handler struct {
 	Runner         *Runner
@@ -130,7 +134,9 @@ type Handler struct {
 // picked up on the next poll instead of being remembered as broken.
 func (h *Handler) docCache() *lazymap.LazyMap[*Doc] {
 	h.once.Do(func() {
-		h.docs = lazymap.New[*Doc](&lazymap.Config{Expire: sourceCacheTTL})
+		// Capacity bounds resident memory: a parsed 1 MiB source is ~11 MB,
+		// so this is the ceiling on distinct tracks kept warm per replica.
+		h.docs = lazymap.New[*Doc](&lazymap.Config{Expire: sourceCacheTTL, Capacity: sourceCacheCapacity})
 	})
 	return h.docs
 }
@@ -139,7 +145,11 @@ func (h *Handler) docCache() *lazymap.LazyMap[*Doc] {
 // share one fetch, and a hit skips the source entirely.
 func (h *Handler) docFor(ctx context.Context, key, sourceURL string) (*Doc, *clientError) {
 	doc, err := h.docCache().Get(key, func() (*Doc, error) {
-		d, cerr := h.fetchDoc(ctx, sourceURL)
+		// The fetch is shared by every poller of this key, so it must not
+		// die with the first requester's connection.
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sourceFetchTimeout)
+		defer cancel()
+		d, cerr := h.fetchDoc(fctx, sourceURL)
 		if cerr != nil {
 			return nil, cerr
 		}
@@ -258,7 +268,7 @@ func (h *Handler) fetchDoc(ctx context.Context, sourceURL string) (*Doc, *client
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, &clientError{http.StatusBadRequest, msgBadRequest, errors.Errorf("unsupported source scheme %q", u.Scheme)}
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, sourceFetchTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
 	if err != nil {

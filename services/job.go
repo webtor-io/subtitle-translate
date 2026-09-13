@@ -256,8 +256,11 @@ func (r *Runner) runBatch(ctx context.Context, key, token string, logger *log.En
 	if err := r.translateChunk(bctx, logger, job, targetName, p, idx, texts); err != nil {
 		JobErrors.WithLabelValues("upstream").Inc()
 		logger.WithError(err).Error("upstream failed, stopping")
-		// Keep whatever was translated so a later run resumes from here.
-		_ = r.store.PutProgress(ctx, key, p)
+		// Keep whatever was translated so a later run resumes from here,
+		// even when the job context is already cancelled (shutdown).
+		sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer scancel()
+		_ = r.store.PutProgress(sctx, key, p)
 		return false
 	}
 	if err := r.store.PutProgress(bctx, key, p); err != nil {
