@@ -1,6 +1,8 @@
 package services
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -240,4 +242,69 @@ func TestHeadReportsTotalBeforeFirstBatch(t *testing.T) {
 	}
 	close(ft.block)
 	h.Runner.Wait(ArtifactKey("abc", "/movie.srt~vtt/movie.vtt", "pt", "m", PromptVersion))
+}
+
+// TestHandlerHidesSourceErrorFromClient pins that a failed source fetch
+// tells the client nothing about the source: no URL, no dial text.
+func TestHandlerHidesSourceErrorFromClient(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close() // nothing is listening on deadURL any more
+	h, _ := newHandlerForTest(t, &fakeTranslator{}, vttWith(2))
+	rec := do(h, "GET", "/abc/movie.vtt~tr:pt/movie.vtt", deadURL)
+	if rec.Code != 404 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if got := strings.TrimRight(rec.Body.String(), "\n"); got != "source unavailable" {
+		t.Fatalf("body=%q must be the fixed message only", got)
+	}
+}
+
+func TestHandlerRejectsNonHTTPSourceScheme(t *testing.T) {
+	h, _ := newHandlerForTest(t, &fakeTranslator{}, vttWith(2))
+	for _, u := range []string{"file:///etc/passwd", "ftp://example.org/a.vtt", "/relative/a.vtt"} {
+		rec := do(h, "GET", "/abc/movie.vtt~tr:pt/movie.vtt", u)
+		if rec.Code != 400 {
+			t.Errorf("%s: code=%d want 400", u, rec.Code)
+		}
+		if got := strings.TrimRight(rec.Body.String(), "\n"); got != "bad request" {
+			t.Errorf("%s: body=%q", u, got)
+		}
+	}
+}
+
+// errFinalStore fails GetFinal, standing in for an unreachable progress
+// store.
+type errFinalStore struct {
+	*MemoryStore
+}
+
+func (s *errFinalStore) GetFinal(context.Context, string) ([]byte, bool, error) {
+	return nil, false, errors.New("store is down")
+}
+
+func TestHandlerFailsFastWhenFinalLookupFails(t *testing.T) {
+	var fetched int32
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fetched, 1)
+		_, _ = w.Write([]byte(vttWith(2)))
+	}))
+	t.Cleanup(src.Close)
+	h := &Handler{
+		Runner:         NewRunner(&errFinalStore{MemoryStore: NewMemoryStore()}, &fakeTranslator{}, "m", 3, time.Minute),
+		Model:          "m",
+		Client:         src.Client(),
+		MaxSourceBytes: 1 << 20,
+		MaxCues:        5000,
+	}
+	rec := do(h, "GET", "/abc/movie.vtt~tr:pt/movie.vtt", src.URL)
+	if rec.Code != 502 {
+		t.Fatalf("code=%d want 502", rec.Code)
+	}
+	if got := strings.TrimRight(rec.Body.String(), "\n"); got != "upstream state unavailable" {
+		t.Fatalf("body=%q", got)
+	}
+	if n := atomic.LoadInt32(&fetched); n != 0 {
+		t.Fatalf("source fetched %d times: a failed store lookup must not reach the source", n)
+	}
 }

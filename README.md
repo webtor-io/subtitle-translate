@@ -38,11 +38,13 @@ Status codes:
 
 | Code | Meaning |
 |---|---|
-| 400 | Missing/unsupported target language in the path, or missing `X-Source-Url`. |
+| 400 | Missing/unsupported target language in the path, missing `X-Source-Url`, or a source URL whose scheme is not `http`/`https`. |
 | 404 | Source track could not be fetched or parsed. |
 | 413 | Source track exceeds `--max-source-bytes` or `--max-cues`. |
 | 501 | No upstream API key configured — translation is disabled. |
 | 502 | Upstream/store state unavailable while assembling the response. |
+
+Error bodies are fixed strings (`bad request`, `source unavailable`, `source too large`, `too many cues`, `upstream state unavailable`). The cause — source URL, dial error, parse error — is logged, never returned.
 
 A `GET` starts (or resumes) the background job for the key if one isn't already running, and returns the current snapshot immediately (cached final artifact, or the cues translated so far). Callers poll the same URL until `X-Subtitle-Progress` reports done.
 

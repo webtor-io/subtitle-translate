@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -114,6 +115,29 @@ type Handler struct {
 	MaxCues        int
 }
 
+// Client-facing bodies. The real cause is logged and never written to the
+// response: the source URL and the dial error belong to the operator, not
+// to whoever is polling the track.
+const (
+	msgBadRequest      = "bad request"
+	msgSourceUnavail   = "source unavailable"
+	msgSourceTooLarge  = "source too large"
+	msgTooManyCues     = "too many cues"
+	msgUpstreamUnavail = "upstream state unavailable"
+)
+
+// clientError pairs what the client is told with the real cause, which
+// only reaches the log.
+type clientError struct {
+	status int
+	msg    string
+	err    error
+}
+
+func (e *clientError) Error() string { return e.err.Error() }
+
+func (e *clientError) Unwrap() error { return e.err }
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -121,19 +145,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	lang, ok := ParseLang(r.URL.Path)
 	if !ok {
-		http.Error(w, "unsupported or missing target language", http.StatusBadRequest)
+		log.WithField("path", r.URL.Path).Warn("unsupported or missing target language")
+		http.Error(w, msgBadRequest, http.StatusBadRequest)
 		return
 	}
 	sourceURL := r.Header.Get("X-Source-Url")
 	if sourceURL == "" {
-		http.Error(w, "missing X-Source-Url", http.StatusBadRequest)
+		log.WithField("path", r.URL.Path).Warn("missing X-Source-Url")
+		http.Error(w, msgBadRequest, http.StatusBadRequest)
 		return
 	}
 	key := ArtifactKey(r.Header.Get("X-Info-Hash"), r.Header.Get("X-Path"), lang, h.Model, PromptVersion)
 	logger := log.WithFields(log.Fields{"key": key[:12], "lang": lang, "infoHash": r.Header.Get("X-Info-Hash"), "path": r.Header.Get("X-Path")})
 	ctx := r.Context()
 
-	if body, ok, err := h.Runner.store.GetFinal(ctx, key); err == nil && ok {
+	body, found, err := h.Runner.store.GetFinal(ctx, key)
+	if err != nil {
+		// The store is the only thing that can tell a finished artifact from
+		// an unstarted one; without it, fetching the source would be work
+		// spent on an answer we cannot give.
+		logger.WithError(err).Error("failed to read the final artifact")
+		http.Error(w, msgUpstreamUnavail, http.StatusBadGateway)
+		return
+	}
+	if found {
 		writeVTT(w, r, body, 100, 100, true)
 		return
 	}
@@ -156,53 +191,63 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeVTT(w, r, nil, done, total, false)
 		return
 	}
-	doc, status, err := h.fetchDoc(ctx, sourceURL)
-	if err != nil {
-		logger.WithError(err).Warn("source unavailable")
-		http.Error(w, err.Error(), status)
+	doc, cerr := h.fetchDoc(ctx, sourceURL)
+	if cerr != nil {
+		logger.WithError(cerr.err).Warn("source unavailable")
+		http.Error(w, cerr.msg, cerr.status)
 		return
 	}
 	h.Runner.Ensure(ctx, key, &Job{Lang: lang, SourceLang: r.URL.Query().Get("srclang"), Glossary: ParseNames(r.URL.Query().Get("names")), Doc: doc})
 	snap, err := h.Runner.Snapshot(ctx, key, doc)
 	if err != nil {
 		logger.WithError(err).Error("snapshot failed")
-		http.Error(w, "upstream state unavailable", http.StatusBadGateway)
+		http.Error(w, msgUpstreamUnavail, http.StatusBadGateway)
 		return
 	}
 	writeVTT(w, r, snap.Body, snap.Done, snap.Total, snap.Final)
 }
 
-func (h *Handler) fetchDoc(ctx context.Context, sourceURL string) (*Doc, int, error) {
+func (h *Handler) fetchDoc(ctx context.Context, sourceURL string) (*Doc, *clientError) {
+	// Scheme guard before dialing: the source URL arrives in a header, and
+	// only http(s) is a subtitle track. file:// and friends would be read by
+	// the transport as local or intranet resources.
+	u, err := url.Parse(sourceURL)
+	if err != nil {
+		return nil, &clientError{http.StatusBadRequest, msgBadRequest, errors.Wrap(err, "bad source url")}
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, &clientError{http.StatusBadRequest, msgBadRequest, errors.Errorf("unsupported source scheme %q", u.Scheme)}
+	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
 	if err != nil {
-		return nil, http.StatusBadRequest, errors.Wrap(err, "bad source url")
+		return nil, &clientError{http.StatusBadRequest, msgBadRequest, errors.Wrap(err, "bad source url")}
 	}
 	res, err := h.Client.Do(req)
 	if err != nil {
-		return nil, http.StatusNotFound, errors.Wrap(err, "source fetch failed")
+		return nil, &clientError{http.StatusNotFound, msgSourceUnavail, errors.Wrap(err, "source fetch failed")}
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return nil, http.StatusNotFound, errors.Errorf("source returned %d", res.StatusCode)
+		return nil, &clientError{http.StatusNotFound, msgSourceUnavail, errors.Errorf("source returned %d", res.StatusCode)}
 	}
 	data, err := io.ReadAll(io.LimitReader(res.Body, h.MaxSourceBytes+1))
 	if err != nil {
-		return nil, http.StatusNotFound, errors.Wrap(err, "source read failed")
+		return nil, &clientError{http.StatusNotFound, msgSourceUnavail, errors.Wrap(err, "source read failed")}
 	}
 	if int64(len(data)) > h.MaxSourceBytes {
-		return nil, http.StatusRequestEntityTooLarge, errors.New("source too large")
+		return nil, &clientError{http.StatusRequestEntityTooLarge, msgSourceTooLarge, errors.Errorf("source over %d bytes", h.MaxSourceBytes)}
 	}
 	doc, err := ParseVTT(bytes.NewReader(data))
 	if err != nil {
-		return nil, http.StatusNotFound, err
+		return nil, &clientError{http.StatusNotFound, msgSourceUnavail, err}
 	}
 	if len(doc.Cues) > h.MaxCues {
-		return nil, http.StatusRequestEntityTooLarge, errors.Errorf("too many cues: %d", len(doc.Cues))
+		return nil, &clientError{http.StatusRequestEntityTooLarge, msgTooManyCues, errors.Errorf("too many cues: %d", len(doc.Cues))}
 	}
 	doc.Normalize()
-	return doc, 0, nil
+	return doc, nil
 }
 
 func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total int, final bool) {
