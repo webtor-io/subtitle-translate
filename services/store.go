@@ -37,7 +37,7 @@ func (m *MemoryStore) GetFinal(_ context.Context, key string) ([]byte, bool, err
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	b, ok := m.final[key]
-	return b, ok, nil
+	return append([]byte(nil), b...), ok, nil
 }
 
 func (m *MemoryStore) PutFinal(_ context.Context, key string, vtt []byte) error {
@@ -85,6 +85,10 @@ func (m *MemoryStore) TryLock(_ context.Context, key string, ttl time.Duration) 
 func (m *MemoryStore) RefreshLock(_ context.Context, key string, ttl time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	until, ok := m.locks[key]
+	if !ok || time.Now().After(until) {
+		return nil
+	}
 	m.locks[key] = time.Now().Add(ttl)
 	return nil
 }

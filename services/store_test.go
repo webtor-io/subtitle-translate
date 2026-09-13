@@ -40,3 +40,56 @@ func TestMemoryStoreContract(t *testing.T) {
 		t.Fatal("progress must be dropped")
 	}
 }
+
+func TestMemoryStoreGetFinalCopies(t *testing.T) {
+	s := NewMemoryStore()
+	ctx := context.Background()
+	original := []byte("WEBVTT\noriginal data")
+	_ = s.PutFinal(ctx, "k", original)
+
+	// Get the bytes and mutate them
+	b1, found, _ := s.GetFinal(ctx, "k")
+	if !found {
+		t.Fatal("should have found final")
+	}
+	// Mutate the returned slice
+	if len(b1) > 0 {
+		b1[0] = 'X'
+	}
+
+	// Verify the stored value is unchanged
+	b2, _, _ := s.GetFinal(ctx, "k")
+	if string(b2) != string(original) {
+		t.Fatalf("stored value was corrupted: got %q expected %q", b2, original)
+	}
+}
+
+func TestMemoryStoreRefreshLockChecksExpiry(t *testing.T) {
+	s := NewMemoryStore()
+	ctx := context.Background()
+
+	// RefreshLock on a never-acquired key should not create a lock
+	_ = s.RefreshLock(ctx, "k", time.Minute)
+
+	// TryLock on "k" must succeed (lock was not created)
+	ok, _ := s.TryLock(ctx, "k", time.Minute)
+	if !ok {
+		t.Fatal("TryLock must succeed on a key where RefreshLock was never called")
+	}
+
+	// Unlock the lock we just acquired
+	_ = s.Unlock(ctx, "k")
+
+	// Create an expired lock
+	expiredTime := time.Now().Add(-time.Minute)
+	s.locks["expired"] = expiredTime
+
+	// RefreshLock on the expired key should not refresh it
+	_ = s.RefreshLock(ctx, "expired", time.Minute)
+
+	// TryLock on "expired" must succeed (lock was expired and not refreshed)
+	ok2, _ := s.TryLock(ctx, "expired", time.Minute)
+	if !ok2 {
+		t.Fatal("TryLock must succeed on an expired lock")
+	}
+}
