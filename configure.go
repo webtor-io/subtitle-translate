@@ -53,7 +53,16 @@ func run(c *cli.Context) error {
 		store := services.NewRedisStore(c, rc, s3c)
 		model := tr.(*services.AnthropicTranslator).Model()
 		runner := services.NewRunner(store, tr, model, c.Int(flagBatchSize), time.Duration(c.Int(flagLockTTL))*time.Second)
-		handler = &services.Handler{Runner: runner, Model: model, Client: &http.Client{Timeout: 35 * time.Second}, MaxSourceBytes: c.Int64(flagMaxSourceBytes), MaxCues: c.Int(flagMaxCues)}
+		// Redirects are not followed: a 3xx is returned as-is and falls into
+		// the non-200 branch of fetchDoc, which maps it to 404. This keeps
+		// the source fetch from being pointed at an arbitrary host via a
+		// redirect chain. The deadline for the whole fetch is the 30s
+		// context set in fetchDoc, so the client itself carries no separate
+		// (and previously inconsistent) Timeout.
+		sourceClient := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
+		handler = &services.Handler{Runner: runner, Model: model, Client: sourceClient, MaxSourceBytes: c.Int64(flagMaxSourceBytes), MaxCues: c.Int(flagMaxCues)}
 	}
 	web := services.NewWeb(c, handler)
 	servers = append(servers, web)

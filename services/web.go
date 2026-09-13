@@ -95,8 +95,8 @@ func ParseNames(q string) []string {
 		if n == "" {
 			continue
 		}
-		if len(n) > 40 {
-			n = n[:40]
+		if r := []rune(n); len(r) > 40 {
+			n = string(r[:40])
 		}
 		out = append(out, n)
 		if len(out) == 30 {
@@ -142,11 +142,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		done, total := 0, 0
 		if p != nil {
 			total = p.Total
+			// HEAD has no Doc, so it cannot tell a still-pending cue from one
+			// that normalized to empty and was never sent for translation
+			// (see countDone in job.go); count every filled-in line instead
+			// of stopping at the first gap, so progress keeps advancing past
+			// structurally-empty cues instead of freezing there.
 			for _, l := range p.Lines {
-				if l == "" {
-					break
+				if l != "" {
+					done++
 				}
-				done++
 			}
 		}
 		writeVTT(w, r, nil, done, total, false)
