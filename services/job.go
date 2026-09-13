@@ -100,6 +100,10 @@ func (r *Runner) Ensure(ctx context.Context, key string, job *Job) {
 	r.mu.Unlock()
 	go func() {
 		defer func() {
+			if rec := recover(); rec != nil {
+				JobErrors.WithLabelValues("panic").Inc()
+				log.WithFields(log.Fields{"key": key, "lang": job.Lang, "panic": rec}).Error("translation job panicked")
+			}
 			r.mu.Lock()
 			delete(r.running, key)
 			r.mu.Unlock()
@@ -125,11 +129,21 @@ func (r *Runner) Wait(key string) {
 func (r *Runner) run(ctx context.Context, key string, job *Job) {
 	start := time.Now()
 	logger := log.WithFields(log.Fields{"key": key, "lang": job.Lang})
-	if _, ok, err := r.store.GetFinal(ctx, key); err == nil && ok {
+	if _, ok, err := r.store.GetFinal(ctx, key); err != nil {
+		JobErrors.WithLabelValues("store").Inc()
+		logger.WithError(err).Error("failed to check final artifact")
+		return
+	} else if ok {
 		return
 	}
 	locked, err := r.store.TryLock(ctx, key, r.lockTTL)
-	if err != nil || !locked {
+	if err != nil {
+		JobErrors.WithLabelValues("store").Inc()
+		logger.WithError(err).Error("failed to acquire lock")
+		return
+	}
+	if !locked {
+		logger.Debug("another worker holds the lock")
 		return
 	}
 	defer func() { _ = r.store.Unlock(ctx, key) }()
