@@ -1,0 +1,16 @@
+name: Docker Image CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'master'
+    tags:
+      - 'v*'
+
+jobs:
+  docker:
+    uses: webtor-io/.github/.github/workflows/docker-multiarch.yml@main
+    permissions:
+      contents: read
+      packages: write
