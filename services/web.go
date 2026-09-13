@@ -74,9 +74,21 @@ func (s *Web) Close() {
 
 var trPathRe = regexp.MustCompile(`~tr:([a-z]{2})/[^/]*\.vtt$`)
 
-// ParseLang takes the target language from the request path: THP does
-// not forward the mod extra, but the reverse proxy keeps the original
-// path, so /…~tr:pt/name.vtt is visible here.
+// TargetLang resolves the target language. torrent-http-proxy strips the
+// mod segment from the path it forwards and sends its argument as
+// X-Mod-Extra (~tr:pt → "pt"); a direct call keeps the full path, so
+// /…~tr:pt/name.vtt is parsed as a fallback.
+func TargetLang(r *http.Request) (string, bool) {
+	if extra := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Mod-Extra"))); extra != "" {
+		if _, ok := LangName(extra); ok {
+			return extra, true
+		}
+		return "", false
+	}
+	return ParseLang(r.URL.Path)
+}
+
+// ParseLang takes the target language from a full ~tr:<lang>/<name>.vtt path.
 func ParseLang(p string) (string, bool) {
 	m := trPathRe.FindStringSubmatch(p)
 	if m == nil {
@@ -193,9 +205,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	lang, ok := ParseLang(r.URL.Path)
+	lang, ok := TargetLang(r)
 	if !ok {
-		log.WithField("path", r.URL.Path).Warn("unsupported or missing target language")
+		log.WithFields(log.Fields{"path": r.URL.Path, "extra": r.Header.Get("X-Mod-Extra")}).Warn("unsupported or missing target language")
 		http.Error(w, msgBadRequest, http.StatusBadRequest)
 		return
 	}

@@ -39,6 +39,25 @@ func do(h http.Handler, method, path, sourceURL string) *httptest.ResponseRecord
 	return rec
 }
 
+func TestTargetLangPrefersModExtraHeader(t *testing.T) {
+	req := httptest.NewRequest("GET", "/Sintel.en.vtt", nil)
+	if _, ok := TargetLang(req); ok {
+		t.Fatal("no header and no ~tr segment must be rejected")
+	}
+	req.Header.Set("X-Mod-Extra", "pt")
+	if got, ok := TargetLang(req); !ok || got != "pt" {
+		t.Fatalf("header lang: got %q ok=%v", got, ok)
+	}
+	req.Header.Set("X-Mod-Extra", "xx")
+	if _, ok := TargetLang(req); ok {
+		t.Fatal("unknown header lang must be rejected, not fall back to the path")
+	}
+	full := httptest.NewRequest("GET", "/abc/movie.vtt~tr:ru/movie.vtt", nil)
+	if got, ok := TargetLang(full); !ok || got != "ru" {
+		t.Fatalf("path fallback: got %q ok=%v", got, ok)
+	}
+}
+
 func TestParseLang(t *testing.T) {
 	for p, want := range map[string]string{
 		"/abc/movie.srt~vtt/movie.vtt~tr:pt/movie.vtt":      "pt",
