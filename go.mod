@@ -1,6 +1,6 @@
 module github.com/webtor-io/subtitle-translate
 
-go 1.23.0
+go 1.25
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.34.0
@@ -13,6 +13,7 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 	github.com/urfave/cli v1.22.16
 	github.com/webtor-io/common-services v0.0.0-20250112153432-554128b56bd5
+	github.com/webtor-io/lazymap v0.0.0-20260807153732-a258d93d42f4
 )
 
 require (

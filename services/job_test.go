@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -56,7 +57,7 @@ func TestRunnerProgressiveThenFinal(t *testing.T) {
 	doc, _ := ParseVTT(strings.NewReader(vttWith(7)))
 	doc.Normalize()
 	ft := &fakeTranslator{block: make(chan struct{})}
-	r := NewRunner(NewMemoryStore(), ft, "m", 3, time.Minute)
+	r := NewRunner(NewMemoryStore(), ft, "m", 3, 4, time.Minute)
 	key := "k1"
 	snap, _ := r.Snapshot(context.Background(), key, doc)
 	if snap.Done != 0 || snap.Final || !strings.HasPrefix(string(snap.Body), "WEBVTT") {
@@ -87,7 +88,7 @@ func TestRunnerResumesFromStoredProgress(t *testing.T) {
 	st := NewMemoryStore()
 	_ = st.PutProgress(context.Background(), "k2", &Progress{Total: 6, Lines: []string{"PT:line 1", "PT:line 2", "PT:line 3", "", "", ""}})
 	ft := &fakeTranslator{}
-	r := NewRunner(st, ft, "m", 3, time.Minute)
+	r := NewRunner(st, ft, "m", 3, 4, time.Minute)
 	r.Ensure(context.Background(), "k2", &Job{Lang: "pt", Doc: doc})
 	r.Wait("k2")
 	if atomic.LoadInt32(&ft.calls) != 1 {
@@ -103,7 +104,7 @@ func TestRunnerKeepsOriginalOnLineMismatch(t *testing.T) {
 	doc, _ := ParseVTT(strings.NewReader(vttWith(2)))
 	doc.Normalize()
 	ft := &fakeTranslator{fail: ErrLineMismatch}
-	r := NewRunner(NewMemoryStore(), ft, "m", 50, time.Minute)
+	r := NewRunner(NewMemoryStore(), ft, "m", 50, 4, time.Minute)
 	r.Ensure(context.Background(), "k3", &Job{Lang: "pt", Doc: doc})
 	r.Wait("k3")
 	snap, _ := r.Snapshot(context.Background(), "k3", doc)
@@ -117,7 +118,7 @@ func TestRunnerStopsOnUpstreamErrorKeepingProgress(t *testing.T) {
 	doc.Normalize()
 	ft := &fakeTranslator{fail: errors.New("boom")}
 	st := NewMemoryStore()
-	r := NewRunner(st, ft, "m", 50, time.Minute)
+	r := NewRunner(st, ft, "m", 50, 4, time.Minute)
 	r.Ensure(context.Background(), "k4", &Job{Lang: "pt", Doc: doc})
 	r.Wait("k4")
 	snap, _ := r.Snapshot(context.Background(), "k4", doc)
@@ -155,7 +156,7 @@ func TestRunnerSplitsTruncatedBatches(t *testing.T) {
 	// One batch of 7; anything over 2 lines truncates, so the runner must
 	// halve its way down (7 → 3+4 → …) until every cue is translated.
 	ft := &stopReasonTranslator{max: 2, fail: ErrTruncated}
-	r := NewRunner(NewMemoryStore(), ft, "m", 50, time.Minute)
+	r := NewRunner(NewMemoryStore(), ft, "m", 50, 4, time.Minute)
 	r.Ensure(context.Background(), "k5", &Job{Lang: "pt", Doc: doc})
 	r.Wait("k5")
 	snap, _ := r.Snapshot(context.Background(), "k5", doc)
@@ -174,7 +175,7 @@ func TestRunnerKeepsSourceForSingleCueTruncation(t *testing.T) {
 	doc.Normalize()
 	// max 0: even a single cue truncates, so the source text is kept.
 	ft := &stopReasonTranslator{max: 0, fail: ErrTruncated}
-	r := NewRunner(NewMemoryStore(), ft, "m", 50, time.Minute)
+	r := NewRunner(NewMemoryStore(), ft, "m", 50, 4, time.Minute)
 	r.Ensure(context.Background(), "k6", &Job{Lang: "pt", Doc: doc})
 	r.Wait("k6")
 	snap, _ := r.Snapshot(context.Background(), "k6", doc)
@@ -187,7 +188,7 @@ func TestRunnerFillsSourceOnRefusal(t *testing.T) {
 	doc, _ := ParseVTT(strings.NewReader(vttWith(4)))
 	doc.Normalize()
 	ft := &stopReasonTranslator{max: 0, fail: ErrRefused}
-	r := NewRunner(NewMemoryStore(), ft, "m", 2, time.Minute)
+	r := NewRunner(NewMemoryStore(), ft, "m", 2, 4, time.Minute)
 	r.Ensure(context.Background(), "k7", &Job{Lang: "pt", Doc: doc})
 	r.Wait("k7")
 	snap, _ := r.Snapshot(context.Background(), "k7", doc)
@@ -223,7 +224,7 @@ func TestRunnerAbortsWhenLockIsLost(t *testing.T) {
 	// job must stop rather than keep writing over someone else's work.
 	st := &stealingStore{MemoryStore: NewMemoryStore()}
 	ft := &fakeTranslator{}
-	r := NewRunner(st, ft, "m", 3, time.Minute)
+	r := NewRunner(st, ft, "m", 3, 4, time.Minute)
 	r.Ensure(context.Background(), "k8", &Job{Lang: "pt", Doc: doc})
 	r.Wait("k8")
 	if got := atomic.LoadInt32(&ft.calls); got != 1 {
@@ -244,7 +245,7 @@ func TestRunnerCloseStopsRunningJobs(t *testing.T) {
 	doc.Normalize()
 	st := NewMemoryStore()
 	ft := &fakeTranslator{block: make(chan struct{})}
-	r := NewRunner(st, ft, "m", 3, time.Minute)
+	r := NewRunner(st, ft, "m", 3, 4, time.Minute)
 	r.Ensure(context.Background(), "k9", &Job{Lang: "pt", Doc: doc})
 	waitForCalls(t, ft, 1)
 	close(ft.block)
@@ -259,4 +260,41 @@ func TestRunnerCloseStopsRunningJobs(t *testing.T) {
 	if p, _ := st.GetProgress(context.Background(), "k10"); p != nil {
 		t.Fatal("a closed runner must not start jobs")
 	}
+}
+
+func TestRunnerLimitsConcurrentJobs(t *testing.T) {
+	doc, _ := ParseVTT(strings.NewReader(vttWith(3)))
+	doc.Normalize()
+	st := NewMemoryStore()
+	ft := &fakeTranslator{block: make(chan struct{})}
+	r := NewRunner(st, ft, "m", 3, 1, time.Minute) // one job at a time
+	// Close waits for the jobs, so the blocked translator has to be released
+	// even when the test fails early.
+	release := releaser(ft.block)
+	defer func() { release(); r.Close() }()
+	r.Ensure(context.Background(), "a", &Job{Lang: "pt", Doc: doc})
+	waitForCalls(t, ft, 1) // job "a" holds the only slot and is blocked
+	r.Ensure(context.Background(), "b", &Job{Lang: "pt", Doc: doc})
+	// While "a" holds the slot, "b" cannot have reached the store at all:
+	// the wait is before TryLock, so no lock and no progress exist for it.
+	if p, _ := st.GetProgress(context.Background(), "b"); p != nil {
+		t.Fatalf("job b ran without a free slot: %+v", p)
+	}
+	probe, ok, _ := st.TryLock(context.Background(), "b", time.Minute)
+	if !ok {
+		t.Fatal("job b must not have taken the lock yet")
+	}
+	_ = st.Unlock(context.Background(), "b", probe)
+	release()
+	r.Wait("a")
+	// "a" freed the slot, so "b" gets to run.
+	waitForCalls(t, ft, 2)
+	r.Wait("b")
+}
+
+// releaser closes c exactly once, so a blocked fake translator can be
+// released both mid-test and from a deferred cleanup after a failure.
+func releaser(c chan struct{}) func() {
+	var once sync.Once
+	return func() { once.Do(func() { close(c) }) }
 }

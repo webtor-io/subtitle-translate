@@ -40,18 +40,24 @@ type Runner struct {
 	// ctx is the lifetime of every background job: Close cancels it, and
 	// jobs drop out at the next context check instead of outliving the
 	// process's other components.
-	ctx     context.Context
-	cancel  context.CancelFunc
+	ctx    context.Context
+	cancel context.CancelFunc
+	// sem bounds how many jobs translate at once: each job holds an upstream
+	// connection and a whole parsed document for its lifetime.
+	sem     chan struct{}
 	wg      sync.WaitGroup
 	mu      sync.Mutex
 	closed  bool
 	running map[string]chan struct{}
 }
 
-func NewRunner(store Store, tr Translator, model string, batchSize int, lockTTL time.Duration) *Runner {
+func NewRunner(store Store, tr Translator, model string, batchSize, maxJobs int, lockTTL time.Duration) *Runner {
+	if maxJobs < 1 {
+		maxJobs = 1
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{store: store, tr: tr, model: model, batchSize: batchSize, lockTTL: lockTTL,
-		ctx: ctx, cancel: cancel, running: map[string]chan struct{}{}}
+		ctx: ctx, cancel: cancel, sem: make(chan struct{}, maxJobs), running: map[string]chan struct{}{}}
 }
 
 // Close stops accepting new jobs, cancels the running ones and waits for
@@ -139,6 +145,17 @@ func (r *Runner) Ensure(_ context.Context, key string, job *Job) {
 			r.mu.Unlock()
 			close(done)
 		}()
+		// The key is registered before the slot is taken, so a burst of
+		// requests for the same track still collapses into one job; what
+		// waits here is the work, not the deduplication.
+		select {
+		case r.sem <- struct{}{}:
+		case <-r.ctx.Done():
+			return
+		}
+		defer func() { <-r.sem }()
+		JobsRunning.Inc()
+		defer JobsRunning.Dec()
 		// The background job outlives the request that triggered it, so it
 		// runs on the runner's own context rather than the request's.
 		r.run(r.ctx, key, job)

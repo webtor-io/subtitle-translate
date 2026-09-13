@@ -23,7 +23,7 @@ func newHandlerForTest(t *testing.T, tr Translator, source string) (*Handler, *h
 		_, _ = w.Write([]byte(source))
 	}))
 	t.Cleanup(src.Close)
-	h := &Handler{Runner: NewRunner(NewMemoryStore(), tr, "m", 3, time.Minute), Model: "m", Client: src.Client(), MaxSourceBytes: 1 << 20, MaxCues: 5000}
+	h := &Handler{Runner: NewRunner(NewMemoryStore(), tr, "m", 3, 4, time.Minute), Model: "m", Client: src.Client(), MaxSourceBytes: 1 << 20, MaxCues: 5000}
 	return h, src
 }
 
@@ -147,7 +147,7 @@ func waitForCalls(t *testing.T, ft *fakeTranslator, n int32) {
 func TestHeadProgressPastStructurallyEmptyCue(t *testing.T) {
 	ft := &fakeTranslator{block: make(chan struct{})}
 	h, src := newHandlerForTest(t, ft, vttWithMusicAt(5, 2))
-	h.Runner = NewRunner(NewMemoryStore(), ft, "m", 1, time.Minute) // batch size 1: one cue per batch
+	h.Runner = NewRunner(NewMemoryStore(), ft, "m", 1, 4, time.Minute) // batch size 1: one cue per batch
 	path := "/abc/movie.srt~vtt/movie.vtt~tr:pt/movie.vtt"
 
 	do(h, "GET", path, src.URL) // starts the background job, cue 0's batch (1st call) blocks
@@ -291,7 +291,7 @@ func TestHandlerFailsFastWhenFinalLookupFails(t *testing.T) {
 	}))
 	t.Cleanup(src.Close)
 	h := &Handler{
-		Runner:         NewRunner(&errFinalStore{MemoryStore: NewMemoryStore()}, &fakeTranslator{}, "m", 3, time.Minute),
+		Runner:         NewRunner(&errFinalStore{MemoryStore: NewMemoryStore()}, &fakeTranslator{}, "m", 3, 4, time.Minute),
 		Model:          "m",
 		Client:         src.Client(),
 		MaxSourceBytes: 1 << 20,
@@ -306,5 +306,35 @@ func TestHandlerFailsFastWhenFinalLookupFails(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&fetched); n != 0 {
 		t.Fatalf("source fetched %d times: a failed store lookup must not reach the source", n)
+	}
+}
+
+func TestHandlerCachesParsedSource(t *testing.T) {
+	var fetched int32
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fetched, 1)
+		_, _ = w.Write([]byte(vttWith(4)))
+	}))
+	t.Cleanup(src.Close)
+	ft := &fakeTranslator{block: make(chan struct{})}
+	h := &Handler{
+		Runner:         NewRunner(NewMemoryStore(), ft, "m", 2, 4, time.Minute),
+		Model:          "m",
+		Client:         src.Client(),
+		MaxSourceBytes: 1 << 20,
+		MaxCues:        5000,
+	}
+	release := releaser(ft.block)
+	defer func() { release(); h.Runner.Close() }()
+	path := "/abc/movie.srt~vtt/movie.vtt~tr:pt/movie.vtt"
+	// A client polls the same URL while the job runs; the source is the
+	// same bytes every time and must be fetched once.
+	for i := 0; i < 3; i++ {
+		if rec := do(h, "GET", path, src.URL); rec.Code != 200 {
+			t.Fatalf("poll %d: code=%d", i, rec.Code)
+		}
+	}
+	if n := atomic.LoadInt32(&fetched); n != 1 {
+		t.Fatalf("source fetched %d times, want 1", n)
 	}
 }

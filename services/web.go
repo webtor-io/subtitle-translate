@@ -11,12 +11,14 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	logrusmiddleware "github.com/bakins/logrus-middleware"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
+	"github.com/webtor-io/lazymap"
 )
 
 const (
@@ -107,12 +109,50 @@ func ParseNames(q string) []string {
 	return out
 }
 
+// sourceCacheTTL is how long a parsed source track is reused. A client
+// polls the same URL every few seconds while the job runs, and the source
+// does not change between polls.
+const sourceCacheTTL = 10 * time.Minute
+
 type Handler struct {
 	Runner         *Runner
 	Model          string
 	Client         *http.Client
 	MaxSourceBytes int64
 	MaxCues        int
+
+	once sync.Once
+	docs *lazymap.LazyMap[*Doc]
+}
+
+// docCache holds the parsed source per artifact key. Failures are not
+// stored (lazymap drops a failed entry), so a source that recovers is
+// picked up on the next poll instead of being remembered as broken.
+func (h *Handler) docCache() *lazymap.LazyMap[*Doc] {
+	h.once.Do(func() {
+		h.docs = lazymap.New[*Doc](&lazymap.Config{Expire: sourceCacheTTL})
+	})
+	return h.docs
+}
+
+// docFor is fetchDoc behind the cache: concurrent pollers of the same key
+// share one fetch, and a hit skips the source entirely.
+func (h *Handler) docFor(ctx context.Context, key, sourceURL string) (*Doc, *clientError) {
+	doc, err := h.docCache().Get(key, func() (*Doc, error) {
+		d, cerr := h.fetchDoc(ctx, sourceURL)
+		if cerr != nil {
+			return nil, cerr
+		}
+		return d, nil
+	})
+	if err != nil {
+		var cerr *clientError
+		if errors.As(err, &cerr) {
+			return nil, cerr
+		}
+		return nil, &clientError{http.StatusBadGateway, msgUpstreamUnavail, err}
+	}
+	return doc, nil
 }
 
 // Client-facing bodies. The real cause is logged and never written to the
@@ -191,7 +231,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeVTT(w, r, nil, done, total, false)
 		return
 	}
-	doc, cerr := h.fetchDoc(ctx, sourceURL)
+	doc, cerr := h.docFor(ctx, key, sourceURL)
 	if cerr != nil {
 		logger.WithError(cerr.err).Warn("source unavailable")
 		http.Error(w, cerr.msg, cerr.status)

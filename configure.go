@@ -15,6 +15,7 @@ const (
 	flagMaxCues        = "max-cues"
 	flagMaxSourceBytes = "max-source-bytes"
 	flagLockTTL        = "lock-ttl"
+	flagMaxJobs        = "max-jobs"
 )
 
 func configure(app *cli.App) {
@@ -31,6 +32,7 @@ func configure(app *cli.App) {
 		cli.IntFlag{Name: flagMaxCues, Value: 5000, EnvVar: "SUBTITLE_TRANSLATE_MAX_CUES"},
 		cli.Int64Flag{Name: flagMaxSourceBytes, Value: 1 << 20, EnvVar: "SUBTITLE_TRANSLATE_MAX_SOURCE_BYTES"},
 		cli.IntFlag{Name: flagLockTTL, Value: 300, EnvVar: "SUBTITLE_TRANSLATE_LOCK_TTL"},
+		cli.IntFlag{Name: flagMaxJobs, Usage: "translation jobs running at once in this replica", Value: 4, EnvVar: "SUBTITLE_TRANSLATE_MAX_JOBS"},
 	)
 	app.Action = run
 }
@@ -52,7 +54,7 @@ func run(c *cli.Context) error {
 		s3c := cs.NewS3Client(c, &http.Client{Timeout: 60 * time.Second})
 		store := services.NewRedisStore(c, rc, s3c)
 		model := tr.(*services.AnthropicTranslator).Model()
-		runner := services.NewRunner(store, tr, model, c.Int(flagBatchSize), time.Duration(c.Int(flagLockTTL))*time.Second)
+		runner := services.NewRunner(store, tr, model, c.Int(flagBatchSize), c.Int(flagMaxJobs), time.Duration(c.Int(flagLockTTL))*time.Second)
 		// Deferred before the web server, so it runs after it: requests stop
 		// first, then the running jobs are canceled and drained, and only
 		// then do the store clients above go away.

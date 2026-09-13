@@ -46,7 +46,9 @@ Status codes:
 
 Error bodies are fixed strings (`bad request`, `source unavailable`, `source too large`, `too many cues`, `upstream state unavailable`). The cause — source URL, dial error, parse error — is logged, never returned.
 
-A `GET` starts (or resumes) the background job for the key if one isn't already running, and returns the current snapshot immediately (cached final artifact, or the cues translated so far). Callers poll the same URL until `X-Subtitle-Progress` reports done.
+A `GET` starts (or resumes) the background job for the key if one isn't already running, and returns the current snapshot immediately (cached final artifact, or the cues translated so far). Callers poll the same URL until `X-Subtitle-Progress` reports done. The parsed source is cached in-process for 10 minutes per key, so polling costs one source fetch, not one per poll.
+
+At most `--max-jobs` translations run at once per replica; further keys are registered immediately and start as slots free up.
 
 ## What survives the round trip
 
@@ -131,6 +133,7 @@ Served when `--use-prom` is set.
 | `subtitle_translate_tokens_output_total` | counter | Upstream output tokens consumed. |
 | `subtitle_translate_batches_fallback_total{reason}` | counter | Batches (or split halves) whose cues kept their source text, by `reason`: `mismatch`, `truncated`, `refusal`. |
 | `subtitle_translate_job_errors_total{code}` | counter | Job errors by cause (`panic`, `store`, `upstream`, `render`, `truncated`, `refusal`, `lock_lost`). |
+| `subtitle_translate_jobs_running` | gauge | Translation jobs holding a concurrency slot (`--max-jobs` bounds it). |
 | `subtitle_translate_job_seconds` | histogram | End-to-end duration of a finished translation job. |
 | `subtitle_translate_line_mismatch_total` | counter | Upstream replies whose line count didn't match the batch (retried once, then the original text is kept). |
 

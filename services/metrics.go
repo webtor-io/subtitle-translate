@@ -9,11 +9,12 @@ var (
 	JobErrors    = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "subtitle_translate_job_errors_total", Help: "job errors by code"}, []string{"code"})
 	JobDuration  = prometheus.NewHistogram(prometheus.HistogramOpts{Name: "subtitle_translate_job_seconds", Help: "job duration", Buckets: []float64{5, 15, 30, 60, 120, 300, 600}})
 	LineMismatch = prometheus.NewCounter(prometheus.CounterOpts{Name: "subtitle_translate_line_mismatch_total", Help: "batches whose reply line count did not match"})
+	JobsRunning  = prometheus.NewGauge(prometheus.GaugeOpts{Name: "subtitle_translate_jobs_running", Help: "translation jobs holding a concurrency slot"})
 	// BatchesFallback counts batches (or split halves) whose cues kept their
 	// source text instead of a translation.
 	BatchesFallback = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "subtitle_translate_batches_fallback_total", Help: "batches left untranslated by reason"}, []string{"reason"})
 )
 
 func init() {
-	prometheus.MustRegister(BatchesTotal, TokensInput, TokensOutput, JobErrors, JobDuration, LineMismatch, BatchesFallback)
+	prometheus.MustRegister(BatchesTotal, TokensInput, TokensOutput, JobErrors, JobDuration, LineMismatch, BatchesFallback, JobsRunning)
 }
