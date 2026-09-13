@@ -1,10 +1,20 @@
 package main
 
 import (
+	"net/http"
+	"time"
+
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	cs "github.com/webtor-io/common-services"
 	"github.com/webtor-io/subtitle-translate/services"
+)
+
+const (
+	flagBatchSize      = "batch-size"
+	flagMaxCues        = "max-cues"
+	flagMaxSourceBytes = "max-source-bytes"
+	flagLockTTL        = "lock-ttl"
 )
 
 func configure(app *cli.App) {
@@ -12,6 +22,16 @@ func configure(app *cli.App) {
 	app.Flags = cs.RegisterProbeFlags(app.Flags)
 	app.Flags = cs.RegisterPromFlags(app.Flags)
 	app.Flags = services.RegisterWebFlags(app.Flags)
+	app.Flags = services.RegisterTranslatorFlags(app.Flags)
+	app.Flags = cs.RegisterRedisClientFlags(app.Flags)
+	app.Flags = cs.RegisterS3ClientFlags(app.Flags)
+	app.Flags = services.RegisterStoreFlags(app.Flags)
+	app.Flags = append(app.Flags,
+		cli.IntFlag{Name: flagBatchSize, Value: 50, EnvVar: "SUBTITLE_TRANSLATE_BATCH_SIZE"},
+		cli.IntFlag{Name: flagMaxCues, Value: 5000, EnvVar: "SUBTITLE_TRANSLATE_MAX_CUES"},
+		cli.Int64Flag{Name: flagMaxSourceBytes, Value: 1 << 20, EnvVar: "SUBTITLE_TRANSLATE_MAX_SOURCE_BYTES"},
+		cli.IntFlag{Name: flagLockTTL, Value: 600, EnvVar: "SUBTITLE_TRANSLATE_LOCK_TTL"},
+	)
 	app.Action = run
 }
 
@@ -25,7 +45,17 @@ func run(c *cli.Context) error {
 		servers = append(servers, prom)
 		defer prom.Close()
 	}
-	web := services.NewWeb(c, services.NotConfiguredHandler())
+	var handler http.Handler = services.NotConfiguredHandler()
+	if tr := services.NewAnthropicTranslator(c); tr != nil {
+		rc := cs.NewRedisClient(c)
+		defer rc.Close()
+		s3c := cs.NewS3Client(c, &http.Client{Timeout: 60 * time.Second})
+		store := services.NewRedisStore(c, rc, s3c)
+		model := tr.(*services.AnthropicTranslator).Model()
+		runner := services.NewRunner(store, tr, model, c.Int(flagBatchSize), time.Duration(c.Int(flagLockTTL))*time.Second)
+		handler = &services.Handler{Runner: runner, Model: model, Client: &http.Client{Timeout: 35 * time.Second}, MaxSourceBytes: c.Int64(flagMaxSourceBytes), MaxCues: c.Int(flagMaxCues)}
+	}
+	web := services.NewWeb(c, handler)
 	servers = append(servers, web)
 	defer web.Close()
 	if err := cs.NewServe(servers...).Serve(); err != nil {
