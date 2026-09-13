@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"io"
+	"net/http"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -43,29 +44,55 @@ func NewRedisStore(c *cli.Context, rc *cs.RedisClient, s3c *cs.S3Client) *RedisS
 	return &RedisStore{rc: rc, s3c: s3c, useS3: c.Bool(flagUseS3) && s3c != nil, bucket: c.String(flagBucket), prefix: c.String(flagS3Prefix)}
 }
 
+// isNotFound reports whether err means "the object is not there". S3
+// spells that three ways: NoSuchKey on a GET, NotFound on a HEAD-shaped
+// reply, and — from implementations that send neither code — a bare HTTP
+// 404. Reading a 404 as a hard failure would make the runner treat a
+// missing artifact as an unreachable store and give up.
+func isNotFound(err error) bool {
+	var rf awserr.RequestFailure
+	if errors.As(err, &rf) && rf.StatusCode() == http.StatusNotFound {
+		return true
+	}
+	var ae awserr.Error
+	if errors.As(err, &ae) {
+		switch ae.Code() {
+		case s3.ErrCodeNoSuchKey, "NotFound":
+			return true
+		}
+	}
+	return false
+}
+
 func (r *RedisStore) GetFinal(ctx context.Context, key string) ([]byte, bool, error) {
 	if !r.useS3 {
 		b, err := r.rc.Get().Get(ctx, "tr:final:"+key).Bytes()
 		if errors.Is(err, redis.Nil) {
 			return nil, false, nil
 		}
-		return b, err == nil, err
+		if err != nil {
+			return nil, false, errors.Wrap(err, "redis get final")
+		}
+		return b, true, nil
 	}
 	out, err := r.s3c.Get().GetObjectWithContext(ctx, &s3.GetObjectInput{Bucket: aws.String(r.bucket), Key: aws.String(r.prefix + key + ".vtt")})
 	if err != nil {
-		if ae, ok := err.(awserr.Error); ok && ae.Code() == s3.ErrCodeNoSuchKey {
+		if isNotFound(err) {
 			return nil, false, nil
 		}
 		return nil, false, errors.Wrap(err, "s3 get")
 	}
 	defer out.Body.Close()
 	b, err := io.ReadAll(out.Body)
-	return b, err == nil, err
+	if err != nil {
+		return nil, false, errors.Wrap(err, "s3 read")
+	}
+	return b, true, nil
 }
 
 func (r *RedisStore) PutFinal(ctx context.Context, key string, vtt []byte) error {
 	if !r.useS3 {
-		return r.rc.Get().Set(ctx, "tr:final:"+key, vtt, 0).Err()
+		return errors.Wrap(r.rc.Get().Set(ctx, "tr:final:"+key, vtt, 0).Err(), "redis put final")
 	}
 	_, err := r.s3c.Get().PutObjectWithContext(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(r.bucket), Key: aws.String(r.prefix + key + ".vtt"),
@@ -94,11 +121,11 @@ func (r *RedisStore) PutProgress(ctx context.Context, key string, p *Progress) e
 	if err := gob.NewEncoder(buf).Encode(p); err != nil {
 		return errors.Wrap(err, "encode progress")
 	}
-	return r.rc.Get().Set(ctx, "tr:cues:"+key, buf.Bytes(), progressTTL).Err()
+	return errors.Wrap(r.rc.Get().Set(ctx, "tr:cues:"+key, buf.Bytes(), progressTTL).Err(), "redis put progress")
 }
 
 func (r *RedisStore) DropProgress(ctx context.Context, key string) error {
-	return r.rc.Get().Del(ctx, "tr:cues:"+key).Err()
+	return errors.Wrap(r.rc.Get().Del(ctx, "tr:cues:"+key).Err(), "redis drop progress")
 }
 
 // refreshLockScript and unlockScript are compare-and-act: they touch the
