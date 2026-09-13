@@ -171,32 +171,12 @@ func (r *Runner) run(ctx context.Context, key string, job *Job) {
 		if len(idx) == 0 {
 			continue
 		}
-		req := BatchRequest{
-			TargetLang: job.Lang,
-			TargetName: targetName,
-			SourceLang: job.SourceLang,
-			Glossary:   job.Glossary,
-			Context:    lastTranslated(p.Lines, b[0], 5),
-			Lines:      lines,
-		}
-		res, err := r.tr.Translate(ctx, req)
-		switch {
-		case err == nil:
-			for i, li := range idx {
-				p.Lines[li] = res.Lines[i]
-			}
-		case errors.Is(err, ErrLineMismatch):
-			logger.WithField("batch", b).Warn("line mismatch, keeping originals")
-			for i, li := range idx {
-				p.Lines[li] = lines[i]
-			}
-		default:
+		if err := r.translateChunk(ctx, logger, job, targetName, p, idx, lines); err != nil {
 			JobErrors.WithLabelValues("upstream").Inc()
 			logger.WithError(err).WithField("batch", b).Error("upstream failed, stopping")
 			_ = r.store.PutProgress(ctx, key, p)
 			return
 		}
-		BatchesTotal.Inc()
 		if err := r.store.PutProgress(ctx, key, p); err != nil {
 			JobErrors.WithLabelValues("store").Inc()
 			logger.WithError(err).Error("failed to store progress")
@@ -218,6 +198,67 @@ func (r *Runner) run(ctx context.Context, key string, job *Job) {
 	_ = r.store.DropProgress(ctx, key)
 	JobDuration.Observe(time.Since(start).Seconds())
 	logger.WithField("seconds", time.Since(start).Seconds()).Info("translation finished")
+}
+
+// translateChunk translates the cues at idx (whose source text is texts)
+// into p.Lines. Recoverable upstream verdicts are absorbed here and the
+// job continues; only an error worth stopping the whole job is returned.
+//
+// A truncated reply is retried as two halves rather than as the same
+// prompt, down to a single cue: the reply was cut off by the output token
+// limit, so the only useful change is asking for less at a time.
+func (r *Runner) translateChunk(ctx context.Context, logger *log.Entry, job *Job, targetName string, p *Progress, idx []int, texts []string) error {
+	res, err := r.tr.Translate(ctx, BatchRequest{
+		TargetLang: job.Lang,
+		TargetName: targetName,
+		SourceLang: job.SourceLang,
+		Glossary:   job.Glossary,
+		Context:    lastTranslated(p.Lines, idx[0], 5),
+		Lines:      texts,
+	})
+	switch {
+	case err == nil:
+		for i, li := range idx {
+			p.Lines[li] = res.Lines[i]
+		}
+		BatchesTotal.Inc()
+		return nil
+	case errors.Is(err, ErrLineMismatch):
+		logger.WithField("cues", len(idx)).Warn("line mismatch, keeping originals")
+		keepSource(p, idx, texts)
+		BatchesFallback.WithLabelValues("mismatch").Inc()
+		return nil
+	case errors.Is(err, ErrTruncated):
+		if len(idx) == 1 {
+			logger.WithField("cue", idx[0]).Warn("single cue truncated, keeping the original")
+			JobErrors.WithLabelValues("truncated").Inc()
+			keepSource(p, idx, texts)
+			BatchesFallback.WithLabelValues("truncated").Inc()
+			return nil
+		}
+		half := len(idx) / 2
+		logger.WithField("cues", len(idx)).Warn("reply truncated, splitting the batch")
+		if err := r.translateChunk(ctx, logger, job, targetName, p, idx[:half], texts[:half]); err != nil {
+			return err
+		}
+		return r.translateChunk(ctx, logger, job, targetName, p, idx[half:], texts[half:])
+	case errors.Is(err, ErrRefused):
+		logger.WithField("cues", len(idx)).Warn("upstream refused the batch, keeping originals")
+		JobErrors.WithLabelValues("refusal").Inc()
+		keepSource(p, idx, texts)
+		BatchesFallback.WithLabelValues("refusal").Inc()
+		return nil
+	default:
+		return err
+	}
+}
+
+// keepSource writes the untranslated source text into the progress, so the
+// cue counts as done and the viewer sees the original instead of a gap.
+func keepSource(p *Progress, idx []int, texts []string) {
+	for i, li := range idx {
+		p.Lines[li] = texts[i]
+	}
 }
 
 // pendingInBatch returns cue indexes in [from,to) that still need a

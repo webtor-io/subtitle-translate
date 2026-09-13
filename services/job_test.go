@@ -128,3 +128,74 @@ func TestRunnerStopsOnUpstreamErrorKeepingProgress(t *testing.T) {
 		t.Fatal("lock must be released after a failed run")
 	}
 }
+
+// stopReasonTranslator fails every batch longer than max lines with fail
+// (a truncation or a refusal), and translates anything shorter.
+type stopReasonTranslator struct {
+	max   int
+	fail  error
+	calls int32
+}
+
+func (f *stopReasonTranslator) Translate(_ context.Context, req BatchRequest) (BatchResult, error) {
+	atomic.AddInt32(&f.calls, 1)
+	if len(req.Lines) > f.max {
+		return BatchResult{}, f.fail
+	}
+	out := make([]string, len(req.Lines))
+	for i, l := range req.Lines {
+		out[i] = "PT:" + l
+	}
+	return BatchResult{Lines: out}, nil
+}
+
+func TestRunnerSplitsTruncatedBatches(t *testing.T) {
+	doc, _ := ParseVTT(strings.NewReader(vttWith(7)))
+	doc.Normalize()
+	// One batch of 7; anything over 2 lines truncates, so the runner must
+	// halve its way down (7 → 3+4 → …) until every cue is translated.
+	ft := &stopReasonTranslator{max: 2, fail: ErrTruncated}
+	r := NewRunner(NewMemoryStore(), ft, "m", 50, time.Minute)
+	r.Ensure(context.Background(), "k5", &Job{Lang: "pt", Doc: doc})
+	r.Wait("k5")
+	snap, _ := r.Snapshot(context.Background(), "k5", doc)
+	if !snap.Final {
+		t.Fatalf("job must finish: %+v", snap)
+	}
+	for i := 1; i <= 7; i++ {
+		if !strings.Contains(string(snap.Body), fmt.Sprintf("PT:line %d", i)) {
+			t.Fatalf("cue %d not translated:\n%s", i, snap.Body)
+		}
+	}
+}
+
+func TestRunnerKeepsSourceForSingleCueTruncation(t *testing.T) {
+	doc, _ := ParseVTT(strings.NewReader(vttWith(2)))
+	doc.Normalize()
+	// max 0: even a single cue truncates, so the source text is kept.
+	ft := &stopReasonTranslator{max: 0, fail: ErrTruncated}
+	r := NewRunner(NewMemoryStore(), ft, "m", 50, time.Minute)
+	r.Ensure(context.Background(), "k6", &Job{Lang: "pt", Doc: doc})
+	r.Wait("k6")
+	snap, _ := r.Snapshot(context.Background(), "k6", doc)
+	if !snap.Final || !strings.Contains(string(snap.Body), "line 1") || strings.Contains(string(snap.Body), "PT:") {
+		t.Fatalf("single-cue truncation must keep originals and finish: %+v", snap)
+	}
+}
+
+func TestRunnerFillsSourceOnRefusal(t *testing.T) {
+	doc, _ := ParseVTT(strings.NewReader(vttWith(4)))
+	doc.Normalize()
+	ft := &stopReasonTranslator{max: 0, fail: ErrRefused}
+	r := NewRunner(NewMemoryStore(), ft, "m", 2, time.Minute)
+	r.Ensure(context.Background(), "k7", &Job{Lang: "pt", Doc: doc})
+	r.Wait("k7")
+	snap, _ := r.Snapshot(context.Background(), "k7", doc)
+	if !snap.Final || !strings.Contains(string(snap.Body), "line 4") || strings.Contains(string(snap.Body), "PT:") {
+		t.Fatalf("refusal must keep originals and finish: %+v", snap)
+	}
+	// A refusal is not retried and never split: one call per batch.
+	if got := atomic.LoadInt32(&ft.calls); got != 2 {
+		t.Fatalf("calls=%d want 2 (one per batch, no splitting)", got)
+	}
+}

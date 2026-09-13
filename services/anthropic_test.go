@@ -27,6 +27,14 @@ func testCtx(t *testing.T, key string) *cli.Context {
 
 func fakeAPI(t *testing.T, replies []string) (*httptest.Server, *int32, *[]map[string]any) {
 	t.Helper()
+	return fakeAPIWithStop(t, replies, "end_turn")
+}
+
+// fakeAPIWithStop serves replies in order (the last one repeats) with a
+// fixed stop_reason, so the truncation and refusal branches can be driven
+// without a real upstream.
+func fakeAPIWithStop(t *testing.T, replies []string, stop string) (*httptest.Server, *int32, *[]map[string]any) {
+	t.Helper()
 	var n int32
 	var bodies []map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -42,7 +50,7 @@ func fakeAPI(t *testing.T, replies []string) (*httptest.Server, *int32, *[]map[s
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id": "msg", "type": "message", "role": "assistant", "model": "test-model",
 			"content":     []map[string]any{{"type": "text", "text": replies[i]}},
-			"stop_reason": "end_turn",
+			"stop_reason": stop,
 			"usage":       map[string]any{"input_tokens": 11, "output_tokens": 7},
 		})
 	}))
@@ -96,5 +104,30 @@ func TestTranslateGivesUpAfterSecondMismatch(t *testing.T) {
 	_, err := tr.Translate(context.Background(), BatchRequest{TargetLang: "pt", TargetName: "Portuguese", Lines: []string{"Hi", "Bye"}})
 	if !errors.Is(err, ErrLineMismatch) || *n != 2 {
 		t.Fatalf("err=%v calls=%d", err, *n)
+	}
+}
+
+func TestTranslateReportsTruncationWithoutRetrying(t *testing.T) {
+	srv, n, _ := fakeAPIWithStop(t, []string{"1: Olá"}, "max_tokens")
+	tr := NewAnthropicTranslator(testCtx(t, "k"), option.WithBaseURL(srv.URL))
+	_, err := tr.Translate(context.Background(), BatchRequest{TargetLang: "pt", TargetName: "Portuguese", Lines: []string{"Hi", "Bye"}})
+	if !errors.Is(err, ErrTruncated) {
+		t.Fatalf("err=%v want ErrTruncated", err)
+	}
+	// The identical prompt would truncate again, so there must be no retry.
+	if *n != 1 {
+		t.Fatalf("calls=%d want 1", *n)
+	}
+}
+
+func TestTranslateReportsRefusalWithoutRetrying(t *testing.T) {
+	srv, n, _ := fakeAPIWithStop(t, []string{""}, "refusal")
+	tr := NewAnthropicTranslator(testCtx(t, "k"), option.WithBaseURL(srv.URL))
+	_, err := tr.Translate(context.Background(), BatchRequest{TargetLang: "pt", TargetName: "Portuguese", Lines: []string{"Hi", "Bye"}})
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("err=%v want ErrRefused", err)
+	}
+	if *n != 1 {
+		t.Fatalf("calls=%d want 1", *n)
 	}
 }

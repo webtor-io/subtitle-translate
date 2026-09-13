@@ -25,7 +25,7 @@ func RegisterTranslatorFlags(f []cli.Flag) []cli.Flag {
 		cli.StringFlag{Name: flagAPIKey, Usage: "upstream model API key; empty disables translation", EnvVar: "ANTHROPIC_API_KEY"},
 		cli.StringFlag{Name: flagModel, Usage: "upstream model id", Value: "claude-haiku-4-5-20251001", EnvVar: "SUBTITLE_TRANSLATE_MODEL"},
 		cli.IntFlag{Name: flagUpstreamTimeout, Usage: "per-batch upstream timeout, seconds", Value: 60, EnvVar: "SUBTITLE_TRANSLATE_UPSTREAM_TIMEOUT"},
-		cli.IntFlag{Name: flagMaxTokens, Usage: "max output tokens per batch", Value: 4096, EnvVar: "SUBTITLE_TRANSLATE_MAX_TOKENS"},
+		cli.IntFlag{Name: flagMaxTokens, Usage: "max output tokens per batch", Value: 8192, EnvVar: "SUBTITLE_TRANSLATE_MAX_TOKENS"},
 	)
 }
 
@@ -58,8 +58,9 @@ func (t *AnthropicTranslator) Model() string { return t.model }
 func (t *AnthropicTranslator) Translate(ctx context.Context, req BatchRequest) (BatchResult, error) {
 	var res BatchResult
 	user := BuildUserPrompt(req)
-	for attempt := 1; attempt <= 2; attempt++ {
-		lines, in, out, err := t.call(ctx, BuildSystemPrompt(req.TargetName), user, len(req.Lines))
+	const attempts = 2
+	for attempt := 1; ; attempt++ {
+		lines, stop, in, out, err := t.call(ctx, BuildSystemPrompt(req.TargetName), user, len(req.Lines))
 		res.InputTokens += in
 		res.OutputTokens += out
 		TokensInput.Add(float64(in))
@@ -68,19 +69,20 @@ func (t *AnthropicTranslator) Translate(ctx context.Context, req BatchRequest) (
 			res.Lines = lines
 			return res, nil
 		}
-		if !errors.Is(err, ErrLineMismatch) {
+		if errors.Is(err, ErrLineMismatch) {
+			LineMismatch.Inc()
+		}
+		// Only a line-count mismatch on a complete reply is worth a second
+		// attempt: a truncated or refused reply would come back the same way
+		// for the identical prompt.
+		if !errors.Is(err, ErrLineMismatch) || stop != anthropic.StopReasonEndTurn || attempt == attempts {
 			return res, err
 		}
-		LineMismatch.Inc()
 		user = user + "\nReminder: output exactly " + strconv.Itoa(len(req.Lines)) + " numbered lines, nothing else.\n"
-		if attempt == 2 {
-			return res, err
-		}
 	}
-	return res, ErrLineMismatch
 }
 
-func (t *AnthropicTranslator) call(ctx context.Context, system, user string, n int) ([]string, int64, int64, error) {
+func (t *AnthropicTranslator) call(ctx context.Context, system, user string, n int) ([]string, anthropic.StopReason, int64, int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, t.timeout)
 	defer cancel()
 	resp, err := t.cl.Messages.New(ctx, anthropic.MessageNewParams{
@@ -91,7 +93,16 @@ func (t *AnthropicTranslator) call(ctx context.Context, system, user string, n i
 		Temperature: anthropic.Float(0),
 	})
 	if err != nil {
-		return nil, 0, 0, errors.Wrap(err, "upstream request failed")
+		return nil, "", 0, 0, errors.Wrap(err, "upstream request failed")
+	}
+	in, out := resp.Usage.InputTokens, resp.Usage.OutputTokens
+	// The stop reason decides before the text does: a reply cut off by the
+	// token limit may still parse into a plausible (but short) list.
+	switch resp.StopReason {
+	case anthropic.StopReasonMaxTokens:
+		return nil, resp.StopReason, in, out, errors.Wrapf(ErrTruncated, "batch of %d lines", n)
+	case anthropic.StopReasonRefusal:
+		return nil, resp.StopReason, in, out, errors.Wrapf(ErrRefused, "batch of %d lines", n)
 	}
 	var sb strings.Builder
 	for _, b := range resp.Content {
@@ -100,5 +111,5 @@ func (t *AnthropicTranslator) call(ctx context.Context, system, user string, n i
 		}
 	}
 	lines, err := ParseReply(sb.String(), n)
-	return lines, resp.Usage.InputTokens, resp.Usage.OutputTokens, err
+	return lines, resp.StopReason, in, out, err
 }

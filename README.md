@@ -118,10 +118,11 @@ Served when `--use-prom` is set.
 
 | Name | Type | Meaning |
 |---|---|---|
-| `subtitle_translate_batches_total` | counter | Cue batches successfully translated. |
+| `subtitle_translate_batches_total` | counter | Cue batches successfully translated (a batch that fell back to source text is not counted here). |
 | `subtitle_translate_tokens_input_total` | counter | Upstream input tokens consumed. |
 | `subtitle_translate_tokens_output_total` | counter | Upstream output tokens consumed. |
-| `subtitle_translate_job_errors_total{code}` | counter | Job errors by cause (`panic`, `store`, `upstream`, `render`). |
+| `subtitle_translate_batches_fallback_total{reason}` | counter | Batches (or split halves) whose cues kept their source text, by `reason`: `mismatch`, `truncated`, `refusal`. |
+| `subtitle_translate_job_errors_total{code}` | counter | Job errors by cause (`panic`, `store`, `upstream`, `render`, `truncated`, `refusal`). |
 | `subtitle_translate_job_seconds` | histogram | End-to-end duration of a finished translation job. |
 | `subtitle_translate_line_mismatch_total` | counter | Upstream replies whose line count didn't match the batch (retried once, then the original text is kept). |
 

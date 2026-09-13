@@ -28,7 +28,14 @@ type Translator interface {
 	Translate(ctx context.Context, req BatchRequest) (BatchResult, error)
 }
 
-var ErrLineMismatch = errors.New("reply line count does not match the request")
+var (
+	ErrLineMismatch = errors.New("reply line count does not match the request")
+	// ErrTruncated: the reply hit the output token limit. Retrying the
+	// identical prompt would truncate again; the caller splits instead.
+	ErrTruncated = errors.New("reply was truncated by the output token limit")
+	// ErrRefused: the model declined to answer. Not retryable either.
+	ErrRefused = errors.New("upstream refused to translate the batch")
+)
 
 var replyLineRe = regexp.MustCompile(`^\s*(\d+)\s*[:.)]\s*(.*)$`)
 
