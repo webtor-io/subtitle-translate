@@ -222,3 +222,22 @@ func TestHeadAgainstFinalArtifact(t *testing.T) {
 		t.Fatalf("head against final: code=%d headers=%v body=%d", rec.Code, rec.Header(), rec.Body.Len())
 	}
 }
+
+// TestHeadReportsTotalBeforeFirstBatch pins the contract that "0/0" means
+// "unknown, the job has not registered yet": once a GET has started the
+// job, HEAD must report the real cue count even though no batch has come
+// back yet.
+func TestHeadReportsTotalBeforeFirstBatch(t *testing.T) {
+	ft := &fakeTranslator{block: make(chan struct{})}
+	h, src := newHandlerForTest(t, ft, vttWith(5))
+	path := "/abc/movie.srt~vtt/movie.vtt~tr:pt/movie.vtt"
+	do(h, "GET", path, src.URL)
+	// The first Translate call means the job is past registering progress.
+	waitForCalls(t, ft, 1)
+	rec := do(h, "HEAD", path, src.URL)
+	if rec.Code != 200 || rec.Header().Get("X-Subtitle-Progress") != "0/5" {
+		t.Fatalf("head before the first batch: code=%d progress=%s", rec.Code, rec.Header().Get("X-Subtitle-Progress"))
+	}
+	close(ft.block)
+	h.Runner.Wait(ArtifactKey("abc", "/movie.srt~vtt/movie.vtt", "pt", "m", PromptVersion))
+}

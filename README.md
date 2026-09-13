@@ -28,7 +28,9 @@ Optional query parameters:
 
 Response headers:
 
-- `X-Subtitle-Progress: done/total` — cues translated so far out of the total cue count; `done == total` means the artifact is finished. `HEAD` reports progress without triggering or waiting on a translation.
+- `X-Subtitle-Progress: done/total` — cues translated so far out of the total cue count. `HEAD` reports progress without triggering or waiting on a translation.
+  - `0/0` means **unknown**: no job has registered for this key yet (nothing started it, or it is still fetching the source). Keep polling — it is not "nothing to translate".
+  - The artifact is complete only when `done == total` **and** `total > 0`, or when the response carries the final `Cache-Control: public, max-age=86400`.
 - `Cache-Control: public, max-age=86400` on the finished artifact,
   `Cache-Control: no-store` on a partial (in-progress) response.
 

@@ -157,6 +157,14 @@ func (r *Runner) run(ctx context.Context, key string, job *Job) {
 	if p == nil || len(p.Lines) != len(job.Doc.Cues) {
 		p = &Progress{Total: len(job.Doc.Cues), Lines: make([]string, len(job.Doc.Cues))}
 	}
+	// Publish the cue count before the first batch: until this lands, HEAD
+	// has no progress record to read and reports 0/0, which the client is
+	// told to read as "unknown, keep polling" rather than "nothing to do".
+	if err := r.store.PutProgress(ctx, key, p); err != nil {
+		JobErrors.WithLabelValues("store").Inc()
+		logger.WithError(err).Error("failed to register progress")
+		return
+	}
 	targetName, _ := LangName(job.Lang)
 	for _, b := range Batches(len(job.Doc.Cues), r.batchSize) {
 		idx, lines := pendingInBatch(job.Doc, p.Lines, b[0], b[1])
