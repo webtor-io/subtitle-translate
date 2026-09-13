@@ -26,6 +26,8 @@ Optional query parameters:
 - `?srclang=<code>` — source language hint passed to the model.
 - `?names=a,b,c` — glossary of proper names/terms to keep untranslated or transliterate consistently; comma-separated, trimmed, capped at 30 entries of 40 runes each.
 
+Neither parameter is part of the cache key, and that is deliberate: the artifact is shared by everyone watching the track, so the first requester's hint and glossary are baked into it. Key stability across viewers is the point — a per-request key would translate the same film once per visitor.
+
 Response headers:
 
 - `X-Subtitle-Progress: done/total` — cues translated so far out of the total cue count. `HEAD` reports progress without triggering or waiting on a translation.
@@ -99,7 +101,7 @@ GLOBAL OPTIONS:
    --anthropic-api-key value           upstream model API key; empty disables translation [$ANTHROPIC_API_KEY]
    --model value                       upstream model id (default: "claude-haiku-4-5-20251001") [$SUBTITLE_TRANSLATE_MODEL]
    --upstream-timeout value            per-batch upstream timeout, seconds (default: 60) [$SUBTITLE_TRANSLATE_UPSTREAM_TIMEOUT]
-   --max-tokens value                  max output tokens per batch (default: 4096) [$SUBTITLE_TRANSLATE_MAX_TOKENS]
+   --max-tokens value                  max output tokens per batch (default: 8192) [$SUBTITLE_TRANSLATE_MAX_TOKENS]
    --redis-host value                  redis host (default: "localhost") [$REDIS_MASTER_SERVICE_HOST, $ REDIS_SERVICE_HOST]
    --redis-port value                  redis port (default: 6379) [$REDIS_MASTER_SERVICE_PORT, $ REDIS_SERVICE_PORT]
    --redis-pass value                  redis pass [$REDIS_PASS]
@@ -114,10 +116,11 @@ GLOBAL OPTIONS:
    --use-s3                            store finished translations in S3 [$USE_S3]
    --aws-bucket value                  S3 bucket (one bucket per service) (default: "subtitle-translate") [$AWS_BUCKET]
    --s3-prefix value                   optional S3 key prefix [$S3_PREFIX]
-   --batch-size value                  (default: 50) [$SUBTITLE_TRANSLATE_BATCH_SIZE]
-   --max-cues value                    (default: 5000) [$SUBTITLE_TRANSLATE_MAX_CUES]
-   --max-source-bytes value            (default: 1048576) [$SUBTITLE_TRANSLATE_MAX_SOURCE_BYTES]
-   --lock-ttl value                    (default: 300) [$SUBTITLE_TRANSLATE_LOCK_TTL]
+   --batch-size value                  cues per upstream request (default: 50) [$SUBTITLE_TRANSLATE_BATCH_SIZE]
+   --max-cues value                    largest source track accepted, in cues (default: 5000) [$SUBTITLE_TRANSLATE_MAX_CUES]
+   --max-source-bytes value            largest source track accepted, in bytes (default: 1048576) [$SUBTITLE_TRANSLATE_MAX_SOURCE_BYTES]
+   --lock-ttl value                    how long one replica owns a translation key, seconds; also the per-batch deadline (default: 300) [$SUBTITLE_TRANSLATE_LOCK_TTL]
+   --max-jobs value                    translation jobs running at once in this replica (default: 4) [$SUBTITLE_TRANSLATE_MAX_JOBS]
    --help, -h                          show help
    --version, -v                       print the version
 ```
@@ -136,6 +139,10 @@ Served when `--use-prom` is set.
 | `subtitle_translate_jobs_running` | gauge | Translation jobs holding a concurrency slot (`--max-jobs` bounds it). |
 | `subtitle_translate_job_seconds` | histogram | End-to-end duration of a finished translation job. |
 | `subtitle_translate_line_mismatch_total` | counter | Upstream replies whose line count didn't match the batch (retried once, then the original text is kept). |
+
+## Cost
+
+Output tokens dominate: the model writes roughly as much as it reads, and the source is sent once per batch with a few lines of context. On the default model a 2-hour film (~1500 cues) costs about **$0.3–0.5** to translate into one language. The result is cached per track and language, so the cost is paid once, not per viewer — and `--max-cues` bounds the worst single request.
 
 ## Local run
 

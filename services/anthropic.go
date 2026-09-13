@@ -38,7 +38,7 @@ type AnthropicTranslator struct {
 
 // NewAnthropicTranslator returns nil when no key is configured: the
 // capability is absent, and the handler answers 501.
-func NewAnthropicTranslator(c *cli.Context, opts ...option.RequestOption) Translator {
+func NewAnthropicTranslator(c *cli.Context, opts ...option.RequestOption) *AnthropicTranslator {
 	key := strings.TrimSpace(c.String(flagAPIKey))
 	if key == "" {
 		log.Info("no upstream API key: translation disabled")

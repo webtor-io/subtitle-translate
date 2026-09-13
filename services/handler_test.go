@@ -23,7 +23,7 @@ func newHandlerForTest(t *testing.T, tr Translator, source string) (*Handler, *h
 		_, _ = w.Write([]byte(source))
 	}))
 	t.Cleanup(src.Close)
-	h := &Handler{Runner: NewRunner(NewMemoryStore(), tr, "m", 3, 4, time.Minute), Model: "m", Client: src.Client(), MaxSourceBytes: 1 << 20, MaxCues: 5000}
+	h := &Handler{Runner: NewRunner(NewMemoryStore(), tr, 3, 4, time.Minute), Model: "m", Client: src.Client(), MaxSourceBytes: 1 << 20, MaxCues: 5000}
 	return h, src
 }
 
@@ -85,7 +85,8 @@ func TestHandlerProgressiveGetAndHead(t *testing.T) {
 		t.Fatalf("body=%q", rec.Body.String())
 	}
 	ft.block <- struct{}{}
-	time.Sleep(50 * time.Millisecond)
+	// Batch 2 starts only after batch 1 was stored.
+	waitForCalls(t, ft, 2)
 	rec = do(h, "HEAD", path, src.URL)
 	if rec.Code != 200 || rec.Header().Get("X-Subtitle-Progress") != "3/5" || rec.Body.Len() != 0 {
 		t.Fatalf("head: code=%d progress=%s body=%d", rec.Code, rec.Header().Get("X-Subtitle-Progress"), rec.Body.Len())
@@ -129,17 +130,6 @@ func vttWithMusicAt(n, musicIdx int) string {
 	return b.String()
 }
 
-func waitForCalls(t *testing.T, ft *fakeTranslator, n int32) {
-	t.Helper()
-	for i := 0; i < 100; i++ {
-		if atomic.LoadInt32(&ft.calls) >= n {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %d calls, got %d", n, atomic.LoadInt32(&ft.calls))
-}
-
 // TestHeadProgressPastStructurallyEmptyCue is a negative control for the
 // break-on-first-empty-line bug: with a music-only cue at index 2 (never
 // translated, its p.Lines entry stays "" forever), HEAD's progress must
@@ -147,7 +137,7 @@ func waitForCalls(t *testing.T, ft *fakeTranslator, n int32) {
 func TestHeadProgressPastStructurallyEmptyCue(t *testing.T) {
 	ft := &fakeTranslator{block: make(chan struct{})}
 	h, src := newHandlerForTest(t, ft, vttWithMusicAt(5, 2))
-	h.Runner = NewRunner(NewMemoryStore(), ft, "m", 1, 4, time.Minute) // batch size 1: one cue per batch
+	h.Runner = NewRunner(NewMemoryStore(), ft, 1, 4, time.Minute) // batch size 1: one cue per batch
 	path := "/abc/movie.srt~vtt/movie.vtt~tr:pt/movie.vtt"
 
 	do(h, "GET", path, src.URL) // starts the background job, cue 0's batch (1st call) blocks
@@ -291,7 +281,7 @@ func TestHandlerFailsFastWhenFinalLookupFails(t *testing.T) {
 	}))
 	t.Cleanup(src.Close)
 	h := &Handler{
-		Runner:         NewRunner(&errFinalStore{MemoryStore: NewMemoryStore()}, &fakeTranslator{}, "m", 3, 4, time.Minute),
+		Runner:         NewRunner(&errFinalStore{MemoryStore: NewMemoryStore()}, &fakeTranslator{}, 3, 4, time.Minute),
 		Model:          "m",
 		Client:         src.Client(),
 		MaxSourceBytes: 1 << 20,
@@ -318,7 +308,7 @@ func TestHandlerCachesParsedSource(t *testing.T) {
 	t.Cleanup(src.Close)
 	ft := &fakeTranslator{block: make(chan struct{})}
 	h := &Handler{
-		Runner:         NewRunner(NewMemoryStore(), ft, "m", 2, 4, time.Minute),
+		Runner:         NewRunner(NewMemoryStore(), ft, 2, 4, time.Minute),
 		Model:          "m",
 		Client:         src.Client(),
 		MaxSourceBytes: 1 << 20,

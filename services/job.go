@@ -34,7 +34,6 @@ type Snapshot struct {
 type Runner struct {
 	store     Store
 	tr        Translator
-	model     string
 	batchSize int
 	lockTTL   time.Duration
 	// ctx is the lifetime of every background job: Close cancels it, and
@@ -51,12 +50,12 @@ type Runner struct {
 	running map[string]chan struct{}
 }
 
-func NewRunner(store Store, tr Translator, model string, batchSize, maxJobs int, lockTTL time.Duration) *Runner {
+func NewRunner(store Store, tr Translator, batchSize, maxJobs int, lockTTL time.Duration) *Runner {
 	if maxJobs < 1 {
 		maxJobs = 1
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Runner{store: store, tr: tr, model: model, batchSize: batchSize, lockTTL: lockTTL,
+	return &Runner{store: store, tr: tr, batchSize: batchSize, lockTTL: lockTTL,
 		ctx: ctx, cancel: cancel, sem: make(chan struct{}, maxJobs), running: map[string]chan struct{}{}}
 }
 
