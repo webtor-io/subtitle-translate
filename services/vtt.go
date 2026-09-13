@@ -43,7 +43,7 @@ func ParseVTT(r io.Reader) (*Doc, error) {
 
 var (
 	hiTagRe     = regexp.MustCompile(`\[[^\]]*\]|\([^)]*\)`)
-	musicOnlyRe = regexp.MustCompile(`^[\s♪#♫]*$`)
+	musicOnlyRe = regexp.MustCompile(`^[\s♪#♫♬]*$`)
 	spacesRe    = regexp.MustCompile(`\s{2,}`)
 )
 
@@ -98,7 +98,9 @@ func (d *Doc) Render(translated []string, upTo int) ([]byte, error) {
 	if upTo > len(d.Cues) {
 		upTo = len(d.Cues)
 	}
-	out := &astisub.Subtitles{Metadata: d.Items.Metadata}
+	// Styles and regions are document-level: a cue referencing one by name
+	// renders wrong without its definition.
+	out := &astisub.Subtitles{Metadata: d.Items.Metadata, Styles: d.Items.Styles, Regions: d.Items.Regions}
 	for i := 0; i < upTo; i++ {
 		src := d.Items.Items[i]
 		var lines []astisub.Line
@@ -112,7 +114,17 @@ func (d *Doc) Render(translated []string, upTo int) ([]byte, error) {
 				lines = append(lines, astisub.Line{Items: []astisub.LineItem{{Text: line}}})
 			}
 		}
-		out.Items = append(out.Items, &astisub.Item{StartAt: src.StartAt, EndAt: src.EndAt, Lines: lines})
+		// Cue settings (align/line/position/size, style and region) belong to
+		// the timing, not to the text, so they carry over verbatim: a
+		// translated cue must stay where the source put it.
+		out.Items = append(out.Items, &astisub.Item{
+			StartAt:     src.StartAt,
+			EndAt:       src.EndAt,
+			InlineStyle: src.InlineStyle,
+			Region:      src.Region,
+			Style:       src.Style,
+			Lines:       lines,
+		})
 	}
 	buf := &bytes.Buffer{}
 	if len(out.Items) == 0 {

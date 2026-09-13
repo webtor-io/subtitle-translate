@@ -92,3 +92,52 @@ func TestSplitJoinRoundTrip(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+const positionedVTT = `WEBVTT
+
+STYLE
+::cue { color: yellow; }
+
+REGION
+id:top
+width:40%
+
+1
+00:00:01.000 --> 00:00:02.000 align:start line:5%
+Hello there.
+
+2
+00:00:03.000 --> 00:00:04.000 position:10% size:35%
+General Kenobi.
+`
+
+func TestRenderKeepsCuePositioning(t *testing.T) {
+	d, err := ParseVTT(strings.NewReader(positionedVTT))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Normalize()
+	out, err := d.Render([]string{"Olá.", ""}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	for _, want := range []string{"align:start", "line:5%", "position:10%", "size:35%"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("rendered cue lost %q:\n%s", want, s)
+		}
+	}
+	// The positioning must survive on the translated cue, not only on the
+	// untouched one.
+	if !strings.Contains(s, "align:start line:5%") || !strings.Contains(s, "Olá.") {
+		t.Errorf("translated cue lost its settings:\n%s", s)
+	}
+}
+
+func TestNormalizeStripsBeamedMusicNote(t *testing.T) {
+	d, _ := ParseVTT(strings.NewReader("WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.000\n♬ ♬\n"))
+	d.Normalize()
+	if len(d.Cues[0].Lines) != 0 {
+		t.Fatalf("beamed-note cue must normalize to empty, got %v", d.Cues[0].Lines)
+	}
+}

@@ -46,6 +46,12 @@ Status codes:
 
 A `GET` starts (or resumes) the background job for the key if one isn't already running, and returns the current snapshot immediately (cached final artifact, or the cues translated so far). Callers poll the same URL until `X-Subtitle-Progress` reports done.
 
+## What survives the round trip
+
+Cue timings and cue count are never changed: a cue that normalizes to nothing stays as an empty cue at its own timestamp. Cue settings (`align`, `line`, `position`, `size`, `region`), the cue's style and region references, and the document-level `STYLE` and `REGION` blocks are copied from the source onto the translation.
+
+Inline markup **inside** cue text is flattened: voice spans (`<v Speaker>`), `<b>/<i>/<u>`, class and timestamp tags come back as plain text. The model is sent text and returns text, so the tags do not survive. Hearing-impaired markup (`[DOOR SLAMS]`, `(sighs)`) and music-only lines are stripped before translation.
+
 ## Supported languages
 
 ```
