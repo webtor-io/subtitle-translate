@@ -101,14 +101,39 @@ func (r *RedisStore) DropProgress(ctx context.Context, key string) error {
 	return r.rc.Get().Del(ctx, "tr:cues:"+key).Err()
 }
 
-func (r *RedisStore) TryLock(ctx context.Context, key string, ttl time.Duration) (bool, error) {
-	return r.rc.Get().SetNX(ctx, "tr:lock:"+key, "1", ttl).Result()
+// refreshLockScript and unlockScript are compare-and-act: they touch the
+// key only while it still carries this holder's token, so a job that lost
+// its lock cannot extend or delete its successor's.
+const refreshLockScript = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pexpire", KEYS[1], ARGV[2]) else return 0 end`
+
+const unlockScript = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`
+
+func (r *RedisStore) TryLock(ctx context.Context, key string, ttl time.Duration) (string, bool, error) {
+	token, err := newLockToken()
+	if err != nil {
+		return "", false, err
+	}
+	ok, err := r.rc.Get().SetNX(ctx, "tr:lock:"+key, token, ttl).Result()
+	if err != nil {
+		return "", false, errors.Wrap(err, "redis lock")
+	}
+	if !ok {
+		return "", false, nil
+	}
+	return token, true, nil
 }
 
-func (r *RedisStore) RefreshLock(ctx context.Context, key string, ttl time.Duration) error {
-	return r.rc.Get().Expire(ctx, "tr:lock:"+key, ttl).Err()
+func (r *RedisStore) RefreshLock(ctx context.Context, key string, token string, ttl time.Duration) (bool, error) {
+	n, err := r.rc.Get().Eval(ctx, refreshLockScript, []string{"tr:lock:" + key}, token, ttl.Milliseconds()).Int64()
+	if err != nil {
+		return false, errors.Wrap(err, "redis refresh lock")
+	}
+	return n == 1, nil
 }
 
-func (r *RedisStore) Unlock(ctx context.Context, key string) error {
-	return r.rc.Get().Del(ctx, "tr:lock:"+key).Err()
+func (r *RedisStore) Unlock(ctx context.Context, key string, token string) error {
+	if err := r.rc.Get().Eval(ctx, unlockScript, []string{"tr:lock:" + key}, token).Err(); err != nil {
+		return errors.Wrap(err, "redis unlock")
+	}
+	return nil
 }

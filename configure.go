@@ -30,7 +30,7 @@ func configure(app *cli.App) {
 		cli.IntFlag{Name: flagBatchSize, Value: 50, EnvVar: "SUBTITLE_TRANSLATE_BATCH_SIZE"},
 		cli.IntFlag{Name: flagMaxCues, Value: 5000, EnvVar: "SUBTITLE_TRANSLATE_MAX_CUES"},
 		cli.Int64Flag{Name: flagMaxSourceBytes, Value: 1 << 20, EnvVar: "SUBTITLE_TRANSLATE_MAX_SOURCE_BYTES"},
-		cli.IntFlag{Name: flagLockTTL, Value: 600, EnvVar: "SUBTITLE_TRANSLATE_LOCK_TTL"},
+		cli.IntFlag{Name: flagLockTTL, Value: 300, EnvVar: "SUBTITLE_TRANSLATE_LOCK_TTL"},
 	)
 	app.Action = run
 }
@@ -53,6 +53,10 @@ func run(c *cli.Context) error {
 		store := services.NewRedisStore(c, rc, s3c)
 		model := tr.(*services.AnthropicTranslator).Model()
 		runner := services.NewRunner(store, tr, model, c.Int(flagBatchSize), time.Duration(c.Int(flagLockTTL))*time.Second)
+		// Deferred before the web server, so it runs after it: requests stop
+		// first, then the running jobs are canceled and drained, and only
+		// then do the store clients above go away.
+		defer runner.Close()
 		// Redirects are not followed: a 3xx is returned as-is and falls into
 		// the non-200 branch of fetchDoc, which maps it to 404. This keeps
 		// the source fetch from being pointed at an arbitrary host via a

@@ -37,12 +37,36 @@ type Runner struct {
 	model     string
 	batchSize int
 	lockTTL   time.Duration
-	mu        sync.Mutex
-	running   map[string]chan struct{}
+	// ctx is the lifetime of every background job: Close cancels it, and
+	// jobs drop out at the next context check instead of outliving the
+	// process's other components.
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	mu      sync.Mutex
+	closed  bool
+	running map[string]chan struct{}
 }
 
 func NewRunner(store Store, tr Translator, model string, batchSize int, lockTTL time.Duration) *Runner {
-	return &Runner{store: store, tr: tr, model: model, batchSize: batchSize, lockTTL: lockTTL, running: map[string]chan struct{}{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Runner{store: store, tr: tr, model: model, batchSize: batchSize, lockTTL: lockTTL,
+		ctx: ctx, cancel: cancel, running: map[string]chan struct{}{}}
+}
+
+// Close stops accepting new jobs, cancels the running ones and waits for
+// them to exit. Each job still releases its lock on the way out: the
+// deferred unlock runs on a fresh context, not on the canceled one.
+func (r *Runner) Close() {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	r.closed = true
+	r.mu.Unlock()
+	r.cancel()
+	r.wg.Wait()
 }
 
 // Snapshot renders what is known for key without starting anything.
@@ -89,16 +113,22 @@ func countDone(lines []string, doc *Doc) int {
 // Ensure starts the background job once per key per process. Safe to call
 // concurrently: only the first caller for a given key spawns a goroutine,
 // cross-replica exclusion is left to the store lock acquired inside run.
-func (r *Runner) Ensure(ctx context.Context, key string, job *Job) {
+func (r *Runner) Ensure(_ context.Context, key string, job *Job) {
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
 	if _, ok := r.running[key]; ok {
 		r.mu.Unlock()
 		return
 	}
 	done := make(chan struct{})
 	r.running[key] = done
+	r.wg.Add(1)
 	r.mu.Unlock()
 	go func() {
+		defer r.wg.Done()
 		defer func() {
 			if rec := recover(); rec != nil {
 				JobErrors.WithLabelValues("panic").Inc()
@@ -110,8 +140,8 @@ func (r *Runner) Ensure(ctx context.Context, key string, job *Job) {
 			close(done)
 		}()
 		// The background job outlives the request that triggered it, so it
-		// gets its own context; the lock TTL bounds how long it may run.
-		r.run(context.Background(), key, job)
+		// runs on the runner's own context rather than the request's.
+		r.run(r.ctx, key, job)
 	}()
 }
 
@@ -136,7 +166,7 @@ func (r *Runner) run(ctx context.Context, key string, job *Job) {
 	} else if ok {
 		return
 	}
-	locked, err := r.store.TryLock(ctx, key, r.lockTTL)
+	token, locked, err := r.store.TryLock(ctx, key, r.lockTTL)
 	if err != nil {
 		JobErrors.WithLabelValues("store").Inc()
 		logger.WithError(err).Error("failed to acquire lock")
@@ -146,7 +176,16 @@ func (r *Runner) run(ctx context.Context, key string, job *Job) {
 		logger.Debug("another worker holds the lock")
 		return
 	}
-	defer func() { _ = r.store.Unlock(ctx, key) }()
+	defer func() {
+		// A fresh context: the job may be exiting because ctx was canceled,
+		// and the lock still has to come off.
+		uctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := r.store.Unlock(uctx, key, token); err != nil {
+			JobErrors.WithLabelValues("store").Inc()
+			logger.WithError(err).Error("failed to release lock")
+		}
+	}()
 
 	p, err := r.store.GetProgress(ctx, key)
 	if err != nil {
@@ -171,18 +210,9 @@ func (r *Runner) run(ctx context.Context, key string, job *Job) {
 		if len(idx) == 0 {
 			continue
 		}
-		if err := r.translateChunk(ctx, logger, job, targetName, p, idx, lines); err != nil {
-			JobErrors.WithLabelValues("upstream").Inc()
-			logger.WithError(err).WithField("batch", b).Error("upstream failed, stopping")
-			_ = r.store.PutProgress(ctx, key, p)
+		if !r.runBatch(ctx, key, token, logger.WithField("batch", b), job, targetName, p, idx, lines) {
 			return
 		}
-		if err := r.store.PutProgress(ctx, key, p); err != nil {
-			JobErrors.WithLabelValues("store").Inc()
-			logger.WithError(err).Error("failed to store progress")
-			return
-		}
-		_ = r.store.RefreshLock(ctx, key, r.lockTTL)
 	}
 	body, err := job.Doc.Render(p.Lines, len(job.Doc.Cues))
 	if err != nil {
@@ -198,6 +228,41 @@ func (r *Runner) run(ctx context.Context, key string, job *Job) {
 	_ = r.store.DropProgress(ctx, key)
 	JobDuration.Observe(time.Since(start).Seconds())
 	logger.WithField("seconds", time.Since(start).Seconds()).Info("translation finished")
+}
+
+// runBatch translates one batch and persists it, all under a deadline of
+// one lock TTL: translate, store and refresh have to fit inside the lease
+// this job holds, otherwise the lock can expire mid-batch and a second
+// worker start on the same key. It returns false when the job must stop.
+func (r *Runner) runBatch(ctx context.Context, key, token string, logger *log.Entry, job *Job, targetName string, p *Progress, idx []int, texts []string) bool {
+	bctx, cancel := context.WithTimeout(ctx, r.lockTTL)
+	defer cancel()
+	if err := r.translateChunk(bctx, logger, job, targetName, p, idx, texts); err != nil {
+		JobErrors.WithLabelValues("upstream").Inc()
+		logger.WithError(err).Error("upstream failed, stopping")
+		// Keep whatever was translated so a later run resumes from here.
+		_ = r.store.PutProgress(ctx, key, p)
+		return false
+	}
+	if err := r.store.PutProgress(bctx, key, p); err != nil {
+		JobErrors.WithLabelValues("store").Inc()
+		logger.WithError(err).Error("failed to store progress")
+		return false
+	}
+	ok, err := r.store.RefreshLock(bctx, key, token, r.lockTTL)
+	if err != nil {
+		JobErrors.WithLabelValues("store").Inc()
+		logger.WithError(err).Error("failed to refresh lock")
+		return false
+	}
+	if !ok {
+		// Someone else owns the key now. Progress stays where it is: it is
+		// the new holder's starting point, not ours to drop.
+		JobErrors.WithLabelValues("lock_lost").Inc()
+		logger.Warn("lock lost, another worker owns this key")
+		return false
+	}
+	return true
 }
 
 // translateChunk translates the cues at idx (whose source text is texts)

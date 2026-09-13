@@ -124,7 +124,7 @@ func TestRunnerStopsOnUpstreamErrorKeepingProgress(t *testing.T) {
 	if snap.Final || snap.Done != 0 {
 		t.Fatalf("must not finish on upstream error: %+v", snap)
 	}
-	if ok, _ := st.TryLock(context.Background(), "k4", time.Minute); !ok {
+	if _, ok, _ := st.TryLock(context.Background(), "k4", time.Minute); !ok {
 		t.Fatal("lock must be released after a failed run")
 	}
 }
@@ -197,5 +197,66 @@ func TestRunnerFillsSourceOnRefusal(t *testing.T) {
 	// A refusal is not retried and never split: one call per batch.
 	if got := atomic.LoadInt32(&ft.calls); got != 2 {
 		t.Fatalf("calls=%d want 2 (one per batch, no splitting)", got)
+	}
+}
+
+// stealingStore hands every key to a foreign holder the moment it is
+// locked, so the lock-lost branch can be driven without timing.
+type stealingStore struct {
+	*MemoryStore
+}
+
+func (s *stealingStore) TryLock(ctx context.Context, key string, ttl time.Duration) (string, bool, error) {
+	token, ok, err := s.MemoryStore.TryLock(ctx, key, ttl)
+	if ok {
+		s.MemoryStore.mu.Lock()
+		s.MemoryStore.locks[key] = memLock{token: "stolen", until: time.Now().Add(ttl)}
+		s.MemoryStore.mu.Unlock()
+	}
+	return token, ok, err
+}
+
+func TestRunnerAbortsWhenLockIsLost(t *testing.T) {
+	doc, _ := ParseVTT(strings.NewReader(vttWith(6)))
+	doc.Normalize()
+	// Steal the key between the job taking it and the first refresh: the
+	// job must stop rather than keep writing over someone else's work.
+	st := &stealingStore{MemoryStore: NewMemoryStore()}
+	ft := &fakeTranslator{}
+	r := NewRunner(st, ft, "m", 3, time.Minute)
+	r.Ensure(context.Background(), "k8", &Job{Lang: "pt", Doc: doc})
+	r.Wait("k8")
+	if got := atomic.LoadInt32(&ft.calls); got != 1 {
+		t.Fatalf("calls=%d: the job must stop at the first lost refresh", got)
+	}
+	snap, _ := r.Snapshot(context.Background(), "k8", doc)
+	if snap.Final {
+		t.Fatal("a job that lost its lock must not publish a final artifact")
+	}
+	// Progress from the batch that did run stays for the new holder.
+	if p, _ := st.GetProgress(context.Background(), "k8"); p == nil || p.Lines[0] == "" {
+		t.Fatalf("progress must be left in place: %+v", p)
+	}
+}
+
+func TestRunnerCloseStopsRunningJobs(t *testing.T) {
+	doc, _ := ParseVTT(strings.NewReader(vttWith(6)))
+	doc.Normalize()
+	st := NewMemoryStore()
+	ft := &fakeTranslator{block: make(chan struct{})}
+	r := NewRunner(st, ft, "m", 3, time.Minute)
+	r.Ensure(context.Background(), "k9", &Job{Lang: "pt", Doc: doc})
+	waitForCalls(t, ft, 1)
+	close(ft.block)
+	r.Close()
+	// Close waits for the job, and the job releases its lock on the way out
+	// even though its context is already canceled.
+	if _, ok, _ := st.TryLock(context.Background(), "k9", time.Minute); !ok {
+		t.Fatal("the lock must be released by the time Close returns")
+	}
+	// A closed runner starts nothing new.
+	r.Ensure(context.Background(), "k10", &Job{Lang: "pt", Doc: doc})
+	if p, _ := st.GetProgress(context.Background(), "k10"); p != nil {
+		t.Fatal("a closed runner must not start jobs")
 	}
 }

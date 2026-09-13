@@ -107,7 +107,7 @@ GLOBAL OPTIONS:
    --batch-size value                  (default: 50) [$SUBTITLE_TRANSLATE_BATCH_SIZE]
    --max-cues value                    (default: 5000) [$SUBTITLE_TRANSLATE_MAX_CUES]
    --max-source-bytes value            (default: 1048576) [$SUBTITLE_TRANSLATE_MAX_SOURCE_BYTES]
-   --lock-ttl value                    (default: 600) [$SUBTITLE_TRANSLATE_LOCK_TTL]
+   --lock-ttl value                    (default: 300) [$SUBTITLE_TRANSLATE_LOCK_TTL]
    --help, -h                          show help
    --version, -v                       print the version
 ```
@@ -122,7 +122,7 @@ Served when `--use-prom` is set.
 | `subtitle_translate_tokens_input_total` | counter | Upstream input tokens consumed. |
 | `subtitle_translate_tokens_output_total` | counter | Upstream output tokens consumed. |
 | `subtitle_translate_batches_fallback_total{reason}` | counter | Batches (or split halves) whose cues kept their source text, by `reason`: `mismatch`, `truncated`, `refusal`. |
-| `subtitle_translate_job_errors_total{code}` | counter | Job errors by cause (`panic`, `store`, `upstream`, `render`, `truncated`, `refusal`). |
+| `subtitle_translate_job_errors_total{code}` | counter | Job errors by cause (`panic`, `store`, `upstream`, `render`, `truncated`, `refusal`, `lock_lost`). |
 | `subtitle_translate_job_seconds` | histogram | End-to-end duration of a finished translation job. |
 | `subtitle_translate_line_mismatch_total` | counter | Upstream replies whose line count didn't match the batch (retried once, then the original text is kept). |
 
