@@ -107,6 +107,9 @@ func TestHandlerProgressiveGetAndHead(t *testing.T) {
 	// Batch 2 starts only after batch 1 was stored.
 	waitForCalls(t, ft, 2)
 	rec = do(h, "HEAD", path, src.URL)
+	if rec.Header().Get("Access-Control-Expose-Headers") != "X-Subtitle-Progress" {
+		t.Fatalf("progress header must be exposed to cross-origin readers: %q", rec.Header().Get("Access-Control-Expose-Headers"))
+	}
 	if rec.Code != 200 || rec.Header().Get("X-Subtitle-Progress") != "3/5" || rec.Body.Len() != 0 {
 		t.Fatalf("head: code=%d progress=%s body=%d", rec.Code, rec.Header().Get("X-Subtitle-Progress"), rec.Body.Len())
 	}

@@ -315,6 +315,9 @@ func (h *Handler) fetchDoc(ctx context.Context, sourceURL string) (*Doc, *client
 func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total int, final bool) {
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	w.Header().Set("X-Subtitle-Progress", strconv.Itoa(done)+"/"+strconv.Itoa(total))
+	// The player polls this header cross-origin (the proxy adds
+	// Access-Control-Allow-Origin itself and passes this one through).
+	w.Header().Set("Access-Control-Expose-Headers", "X-Subtitle-Progress")
 	if final {
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 	} else {
