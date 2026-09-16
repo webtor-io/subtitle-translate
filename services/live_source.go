@@ -33,6 +33,12 @@ type Refresh struct {
 
 // LiveSource follows one subtitle media playlist of a transcoder session.
 type LiveSource struct {
+	// url is the URL fetched from, query included. It is mutable: the same
+	// session arrives with a different query every ~15 s (the player's ?rev=
+	// bump) and can be handed a renewed token, and the newest query is the
+	// one upstream will still accept. Identity — whether two URLs are the
+	// same session at all — is the handler's business (sourceIdentity), and
+	// is decided without the query.
 	url      string
 	client   *http.Client
 	doc      *LiveDoc
@@ -54,6 +60,13 @@ type LiveSource struct {
 	ended      bool
 	contiguous bool
 	retired    bool
+	// runEnded records that the run this source followed is finished and
+	// produced no final artifact: the playlist ended, everything it carried
+	// was translated, and the run was not contiguous so nothing may be
+	// written as final. There is no work left against this source, which is
+	// what keeps a poll from starting a job that would immediately conclude
+	// the same thing.
+	runEnded bool
 	// gone records that the playlist itself answered 404/503 — the session
 	// is over as far as the transcoder is concerned. Retire does not set it:
 	// a source this process replaced in its cache is not evidence about the
@@ -78,6 +91,23 @@ func NewLiveSource(playlistURL string, client *http.Client, maxBytes int64, maxC
 }
 
 func (s *LiveSource) Doc() *LiveDoc { return s.doc }
+
+// URL is the URL this source fetches from right now.
+func (s *LiveSource) URL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.url
+}
+
+// SetURL points the source at a fresher URL for the same session, keeping
+// everything else: the document, the segments already seen, the strikes. The
+// handler calls it when a poll arrives for this session with a different
+// query — a ?rev= bump, or a renewed token.
+func (s *LiveSource) SetURL(u string) {
+	s.mu.Lock()
+	s.url = u
+	s.mu.Unlock()
+}
 
 func (s *LiveSource) Ended() bool {
 	s.mu.Lock()
@@ -114,6 +144,22 @@ func (s *LiveSource) Retire() {
 	s.mu.Lock()
 	s.retired = true
 	s.mu.Unlock()
+}
+
+// MarkRunEnded says this source's run is over with no final artifact to
+// come. See the runEnded field.
+func (s *LiveSource) MarkRunEnded() {
+	s.mu.Lock()
+	s.runEnded = true
+	s.mu.Unlock()
+}
+
+// RunEnded reports whether there is any point starting a job against this
+// source.
+func (s *LiveSource) RunEnded() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runEnded
 }
 
 func (s *LiveSource) get(ctx context.Context, u string) ([]byte, error) {
@@ -246,6 +292,10 @@ func (s *LiveSource) skipSegment(key, name string, cause error) {
 func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 	s.mu.Lock()
 	retired := s.retired
+	// Read once, under the lock, and used for both the playlist fetch and
+	// the base the segment URIs are resolved against: a SetURL landing
+	// mid-pass must not split one refresh across two URLs.
+	u := s.url
 	s.mu.Unlock()
 	if retired {
 		return Refresh{}, ErrSourceGone
@@ -259,7 +309,7 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 		s.lastAttempt = time.Now()
 		s.mu.Unlock()
 	}()
-	data, err := s.get(ctx, s.url)
+	data, err := s.get(ctx, u)
 	if err != nil {
 		if status, ends := endsSession(err); ends {
 			s.mu.Lock()
@@ -269,7 +319,7 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 		}
 		return Refresh{}, err
 	}
-	pl, err := ParseMediaPlaylist(s.url, data)
+	pl, err := ParseMediaPlaylist(u, data)
 	if err != nil {
 		return Refresh{}, err
 	}

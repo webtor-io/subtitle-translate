@@ -23,10 +23,10 @@ Request headers (set by the proxy chain):
 
 Optional query parameters:
 
-- `?srclang=<code>` — source language hint passed to the model.
-- `?names=a,b,c` — glossary of proper names/terms to keep untranslated or transliterate consistently; comma-separated, trimmed, capped at 30 entries of 40 runes each.
+- `?srclang=<code>` — source language hint passed to the model. It must be one of the codes below; anything else is dropped (the hint is optional, so a bad one costs the viewer nothing).
+- `?names=a,b,c` — glossary of proper names/terms to keep untranslated or transliterate consistently; comma-separated, capped at 30 entries of 40 runes each. Each entry is flattened to a single line — control characters and newlines become spaces, runs of whitespace collapse — and entries that come out empty are dropped.
 
-Neither parameter is part of the cache key, and that is deliberate: the artifact is shared by everyone watching the track, so the first requester's hint and glossary are baked into it. Key stability across viewers is the point — a per-request key would translate the same film once per visitor.
+Neither parameter is part of the cache key, and that is deliberate: the artifact is shared by everyone watching the track, so the first requester's hint and glossary are baked into it. Key stability across viewers is the point — a per-request key would translate the same film once per visitor. It is also why both are validated rather than passed through: what the first requester writes into the prompt is what every later viewer of that file and language reads back, for 24 h from Redis and indefinitely from S3.
 
 Response headers:
 
@@ -50,7 +50,7 @@ Status codes:
 
 Error bodies are fixed strings (`bad request`, `source unavailable`, `source too large`, `too many cues`, `upstream state unavailable`). The cause — source URL, dial error, parse error — is logged, never returned.
 
-A `GET` starts (or resumes) the background job for the key if one isn't already running, and returns the current snapshot immediately (cached final artifact, or the cues translated so far). Callers poll the same URL until `X-Subtitle-Progress` reports done. The parsed source is cached in-process for 10 minutes per key, so polling costs one source fetch, not one per poll.
+A `GET` starts (or resumes) the background job for the key if one isn't already running, and returns the current snapshot immediately (cached final artifact, or the cues translated so far). Callers poll the same URL until `X-Subtitle-Progress` reports done. The parsed source is cached in-process for 10 minutes per key, so polling costs one source fetch, not one per poll. Both in-process caches — parsed sources and live sources — hold 16 entries per replica: a parsed 1 MiB track is ~11 MB resident, which is the number that has to fit under the pod's memory limit.
 
 At most `--max-jobs` translations run at once per replica (`--live-max-jobs` for live ones, counted separately); further keys are registered immediately and start as slots free up.
 
@@ -64,6 +64,23 @@ the playlist, fetches the segments it has not seen, shifts their cues by
 a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
 `--live-batch-wait`.
 
+- **A live source is identified by its URL without the query**: scheme, host
+  and path. The transcoder session id lives in the path
+  (`…~hls/session/<id>/s<N>.m3u8`), while the query carries things that change
+  within one session — the player re-requests the track as `?…&rev=<n>` every
+  ~15 s while cues arrive, and the session token can be renewed. A poll whose
+  identity matches the source being followed only updates the URL that source
+  fetches from (the newest query is the one upstream will still accept);
+  nothing is retired, no document is rebuilt and no segment is fetched twice.
+  A different session id is a different session, and swaps the source as
+  before.
+- One key follows **one** source at a time, and the key deliberately outlives
+  a session (`X-Path` is keyed with `/session/<id>/` removed). A second viewer
+  watching the same file and language at a different position therefore shares
+  that one source and may, for a while, be served a document that does not
+  cover where they are — the cues they need arrive once the runs converge on
+  the same range, and a translation already paid for is matched by cue
+  identity rather than bought again. It self-heals; it is not an error state.
 - `X-Subtitle-Live: 1` is set while the playlist is live (no `#EXT-X-ENDLIST`)
   or the job is still writing. Do not read `done == total` as complete while it
   is present. The body carries the translated cues only: a cue not translated
@@ -101,6 +118,10 @@ a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
   from the player's own timeline — the same as every side-loaded track on this
   platform today. Without the window the replayed range is translated and
   rendered twice.
+- A run that ends without producing a final artifact (it joined after a seek,
+  so the document has holes) is finished for good: the record is written with
+  the live flag cleared, and no later poll starts another job against that
+  source. The next transcoder session is new work.
 - Live jobs are bounded by `--live-max-jobs`, separately from `--max-jobs`: a
   live job holds its slot for the length of a film while doing almost nothing,
   so queueing it behind offline work (or offline work behind it) is the wrong

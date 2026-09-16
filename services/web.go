@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	logrusmiddleware "github.com/bakins/logrus-middleware"
 	"github.com/pkg/errors"
@@ -41,11 +42,41 @@ func NotConfiguredHandler() http.Handler {
 	})
 }
 
+// webShutdownGrace is how long Close waits for in-flight requests before
+// the listener goes away regardless.
+const webShutdownGrace = 5 * time.Second
+
 type Web struct {
 	host string
 	port int
 	h    http.Handler
-	ln   net.Listener
+
+	// mu guards ln and srv: Serve runs in its own goroutine (cs.Serve
+	// starts every Servable that way) while Close runs on the main one.
+	mu  sync.Mutex
+	ln  net.Listener
+	srv *http.Server
+}
+
+// newHTTPServer builds the server. The limits are the point of the function
+// existing: they are part of the service's contract with whatever can open a
+// connection to it, and that is the whole cluster network (there is no
+// NetworkPolicy — see the README).
+//
+// MaxHeaderBytes is the Go default. Nothing legitimately sends 50 MB of
+// headers, and against the pod's 512Mi limit a handful of connections that
+// did would end the process. ReadHeaderTimeout and ReadTimeout bound what a
+// slow reader can hold; IdleTimeout bounds a keep-alive connection nobody is
+// using. WriteTimeout is deliberately left unset: a response is written for
+// as long as its render takes, and there is no upper bound worth guessing.
+func newHTTPServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 }
 
 func NewWeb(c *cli.Context, h http.Handler) *Web {
@@ -58,17 +89,54 @@ func (s *Web) Serve() error {
 	if err != nil {
 		return errors.Wrap(err, "failed to listen to tcp connection")
 	}
-	s.ln = ln
 	logger := log.New()
 	m := logrusmiddleware.Middleware{Logger: logger}
-	srv := &http.Server{Handler: m.Handler(s.h, ""), MaxHeaderBytes: 50 << 20}
-	log.Infof("serving web at %v", addr)
-	return srv.Serve(ln)
+	srv := newHTTPServer(m.Handler(s.h, ""))
+	s.mu.Lock()
+	s.ln = ln
+	s.srv = srv
+	s.mu.Unlock()
+	log.Infof("serving web at %v", ln.Addr())
+	err = srv.Serve(ln)
+	if errors.Is(err, http.ErrServerClosed) {
+		// Close asked for this; it is not a serve error, and reporting it as
+		// one would turn an orderly shutdown into a failed exit code.
+		return nil
+	}
+	return err
 }
 
+// addr is the address actually being listened on. With port 0 that is only
+// known after the listen, which is why it is read rather than formatted.
+func (s *Web) addr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ln == nil {
+		return ""
+	}
+	return s.ln.Addr().String()
+}
+
+// Close drains the server: requests in flight get webShutdownGrace to
+// finish, and only then does the listener go away. Closing the listener on
+// its own — what this did before — does nothing to connections already
+// accepted, so a poll being answered at the moment the pod was told to stop
+// was cut mid-response.
 func (s *Web) Close() {
-	if s.ln != nil {
-		_ = s.ln.Close()
+	s.mu.Lock()
+	srv, ln := s.srv, s.ln
+	s.mu.Unlock()
+	if srv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), webShutdownGrace)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.WithError(err).Warn("web server did not drain within its grace period")
+		}
+		// Shutdown closed the listener itself, successfully or not.
+		return
+	}
+	if ln != nil {
+		_ = ln.Close()
 	}
 }
 
@@ -100,13 +168,54 @@ func ParseLang(p string) (string, bool) {
 	return m[1], true
 }
 
+// ParseSourceLang reads the "srclang" query parameter: a hint about the
+// language the track is already in, formatted into the system prompt.
+//
+// It is a language code or it is nothing. The hint is optional and the
+// translation is fine without it, so an unknown value is dropped rather than
+// refused — but it must not reach the prompt as free text: the artifact it
+// helps produce is shared by everyone watching that file and language, and
+// served from cache for 24 h (indefinitely from S3), so whatever the first
+// requester wrote would be baked into what every later viewer reads.
+func ParseSourceLang(q string) string {
+	code := strings.ToLower(strings.TrimSpace(q))
+	if _, ok := LangName(code); !ok {
+		return ""
+	}
+	return code
+}
+
+// flattenName reduces one glossary entry to a single line: control
+// characters (a newline among them) and any other whitespace become single
+// spaces, and the ends are trimmed. Entries are joined into one line of the
+// prompt — "Glossary (character names): a, b, c" — so a newline inside one
+// is not a formatting nuisance but a way to write an instruction of one's
+// own into a prompt whose artifact is then served to every viewer of the
+// track. The same sharing argument as ParseSourceLang, and the same answer.
+func flattenName(n string) string {
+	var b strings.Builder
+	pending := false
+	for _, r := range n {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			pending = b.Len() > 0
+			continue
+		}
+		if pending {
+			b.WriteRune(' ')
+			pending = false
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // ParseNames reads the "names" query parameter (comma-separated glossary
-// entries), trims whitespace, drops empties, and caps the result at 30
-// entries of at most 40 runes each.
+// entries), flattens each to one line (see flattenName), drops the ones that
+// come out empty, and caps the result at 30 entries of at most 40 runes each.
 func ParseNames(q string) []string {
 	var out []string
 	for _, n := range strings.Split(q, ",") {
-		n = strings.TrimSpace(n)
+		n = flattenName(n)
 		if n == "" {
 			continue
 		}
@@ -133,10 +242,20 @@ func ParseNames(q string) []string {
 // instead of reusing what the background job already built — so the value
 // bounds how long an abandoned session's document stays resident, and does
 // not have to exceed the longest film.
+//
+// sourceCacheCapacity and liveCacheCapacity are counted against the pod's
+// 512Mi limit, not against how many tracks one would like to keep warm: a
+// parsed 1 MiB source is ~11 MB in memory, so 16 of them is ~180 MB, and a
+// live entry holds a LiveDoc that may grow to --max-cues. 64 (the previous
+// value, for both) put the ceiling at ~700 MB — a limit that cannot be
+// reached without the pod being killed is not a limit. Live entries are also
+// bounded by --live-max-jobs (16) on the replica that owns the jobs; the
+// cache holds one per key this replica serves, job or no job.
 const (
 	sourceCacheTTL      = 10 * time.Minute
 	liveSourceCacheTTL  = 30 * time.Minute
-	sourceCacheCapacity = 64
+	sourceCacheCapacity = 16
+	liveCacheCapacity   = 16
 	sourceFetchTimeout  = 30 * time.Second
 )
 
@@ -163,7 +282,8 @@ type Handler struct {
 func (h *Handler) docCache() *lazymap.LazyMap[*Doc] {
 	h.once.Do(func() {
 		// Capacity bounds resident memory: a parsed 1 MiB source is ~11 MB,
-		// so this is the ceiling on distinct tracks kept warm per replica.
+		// so this is the ceiling on distinct tracks kept warm per replica
+		// (see the constant for the arithmetic against the pod's limit).
 		h.docs = lazymap.New[*Doc](&lazymap.Config{Expire: sourceCacheTTL, Capacity: sourceCacheCapacity})
 	})
 	return h.docs
@@ -200,8 +320,31 @@ func isPlaylistSource(u *url.URL) bool {
 	return strings.HasSuffix(strings.ToLower(u.Path), ".m3u8")
 }
 
+// sourceIdentity is what makes two live source URLs the same transcoder
+// session: scheme, host and path, with the query deliberately left out.
+//
+// The query is not stable for the length of a session. The player reloads
+// the <track> as ?…&rev=<done> every ~15 s while cues are arriving, and THP
+// copies the raw query into X-Source-Url; the session token can also be
+// renewed mid-session. Comparing full URLs therefore read every reload as a
+// new session — retiring the source, killing the job that was growing it,
+// re-downloading every segment so far, and writing a Live=false the player
+// takes to mean the track is finished. The session id lives in the path
+// (…~hls/session/<id>/s<N>.m3u8), so a real session change is still caught.
+//
+// A URL that does not parse is its own identity: it will fail the scheme
+// guard before anything is fetched, and two of them are only equal to each
+// other.
+func sourceIdentity(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	return u.Scheme + "://" + u.Host + u.Path
+}
+
 // liveEntry is what one artifact key holds: the source being followed now,
-// and the URLs this key has already given up on.
+// and the identities this key has already given up on.
 //
 // The key deliberately survives across transcoder sessions (KeyPath strips
 // the session id), so two viewers of the same file and language share it
@@ -209,8 +352,9 @@ func isPlaylistSource(u *url.URL) bool {
 // has retired is a straggler (a reload, a second tab, an in-flight request,
 // another viewer), not news about a new session.
 type liveEntry struct {
-	mu      sync.Mutex
-	cur     *LiveSource
+	mu  sync.Mutex
+	cur *LiveSource
+	// retired is keyed by sourceIdentity, like every other comparison here.
 	retired map[string]bool
 }
 
@@ -221,7 +365,7 @@ func (h *Handler) livesCache() *lazymap.LazyMap[*liveEntry] {
 		if ttl <= 0 {
 			ttl = liveSourceCacheTTL
 		}
-		h.lives = lazymap.New[*liveEntry](&lazymap.Config{Expire: ttl, Capacity: sourceCacheCapacity})
+		h.lives = lazymap.New[*liveEntry](&lazymap.Config{Expire: ttl, Capacity: liveCacheCapacity})
 	})
 	return h.lives
 }
@@ -241,17 +385,34 @@ func (h *Handler) livesCache() *lazymap.LazyMap[*liveEntry] {
 func (h *Handler) liveFor(key, sourceURL string) *LiveSource {
 	cache := h.livesCache()
 	e, _ := cache.Get(key, func() (*liveEntry, error) {
-		return &liveEntry{cur: NewLiveSource(sourceURL, h.Client, h.MaxSourceBytes, h.MaxCues), retired: map[string]bool{}}, nil
+		// A miss is not always a key this replica has not seen: the cache is
+		// bounded (capacity) and expiring (TTL), and an eviction says nothing
+		// about the job that is still polling the source the entry held.
+		// Building a fresh LiveSource here would put two pollers on one
+		// transcoder session and re-download every segment of the film so
+		// far, so a running job's source is what the key is still on. The
+		// switch below decides whether it is the session being asked for.
+		cur := h.Runner.LiveSource(key)
+		if cur == nil {
+			cur = NewLiveSource(sourceURL, h.Client, h.MaxSourceBytes, h.MaxCues)
+		}
+		return &liveEntry{cur: cur, retired: map[string]bool{}}, nil
 	})
 	// lazymap arms the expiry timer once, when the entry is created; Get
 	// does not reset it. Touch does, and that is the difference between a
 	// TTL that bounds a session and one that bounds idleness.
 	cache.Touch(key)
+	id := sourceIdentity(sourceURL)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	switch {
-	case e.cur.url == sourceURL:
-	case e.retired[sourceURL] && !e.cur.Gone():
+	case sourceIdentity(e.cur.URL()) == id:
+		// The same session, possibly with a fresher query: a ?rev= bump, or
+		// a renewed token. Nothing is retired and nothing is rebuilt — only
+		// the URL the source fetches from is updated, because the newest
+		// query is the one upstream will still accept.
+		e.cur.SetURL(sourceURL)
+	case e.retired[id] && !e.cur.Gone():
 		// A straggler for a session this key gave up on, while the session
 		// it moved to is still alive: serve the current source. Gone is the
 		// transcoder's verdict on the playlist, not our own bookkeeping —
@@ -264,7 +425,7 @@ func (h *Handler) liveFor(key, sourceURL string) *LiveSource {
 		// without this it would keep polling a dead URL for up to one more
 		// PollInterval — plus any in-flight batch — before noticing.
 		e.cur.Retire()
-		e.retired[e.cur.url] = true
+		e.retired[sourceIdentity(e.cur.URL())] = true
 		e.cur = NewLiveSource(sourceURL, h.Client, h.MaxSourceBytes, h.MaxCues)
 	}
 	return e.cur
@@ -360,12 +521,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeVTT(w, r, body, 100, 100, true, false)
 		return
 	}
-	// Touch keeps a live job's idle timer from expiring: polling the
-	// playlist (GET or HEAD) is what keeps the transcoder session alive.
-	// For a regular source there is no idle job to keep, so this is a
-	// harmless no-op.
-	h.Runner.Touch(key)
-
 	if u, perr := url.Parse(sourceURL); perr == nil && isPlaylistSource(u) {
 		// Same scheme guard as fetchDoc, and for the same reason: the
 		// source URL arrives in a header, and file:// and friends would be
@@ -376,6 +531,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, msgBadRequest, http.StatusBadRequest)
 			return
 		}
+		// Touch keeps a live job's idle timer from expiring: polling the
+		// playlist (GET or HEAD) is what keeps the transcoder session alive.
+		// Only the live path leaves a mark — the offline path has no idle
+		// job to keep, and its marks were never dropped: HEAD never reaches
+		// Ensure, so nothing ran the forget that pairs with it, and the map
+		// grew one permanent 64-char entry per key polled.
+		h.Runner.Touch(key)
 		src := h.liveFor(key, sourceURL)
 		// Every poll, GET and HEAD alike, refreshes a source nobody has
 		// read for a poll interval. The background job only runs on the
@@ -424,7 +586,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeVTT(w, r, nil, done, total, false, live)
 			return
 		}
-		h.Runner.Ensure(ctx, key, &Job{Lang: lang, SourceLang: r.URL.Query().Get("srclang"), Glossary: ParseNames(r.URL.Query().Get("names")), Live: src})
+		h.Runner.Ensure(ctx, key, &Job{Lang: lang, SourceLang: ParseSourceLang(r.URL.Query().Get("srclang")), Glossary: ParseNames(r.URL.Query().Get("names")), Live: src})
 		snap, err := h.Runner.LiveSnapshot(ctx, key, src)
 		if err != nil {
 			logger.WithError(err).Error("live snapshot failed")
@@ -467,7 +629,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, cerr.msg, cerr.status)
 		return
 	}
-	h.Runner.Ensure(ctx, key, &Job{Lang: lang, SourceLang: r.URL.Query().Get("srclang"), Glossary: ParseNames(r.URL.Query().Get("names")), Doc: doc})
+	h.Runner.Ensure(ctx, key, &Job{Lang: lang, SourceLang: ParseSourceLang(r.URL.Query().Get("srclang")), Glossary: ParseNames(r.URL.Query().Get("names")), Doc: doc})
 	snap, err := h.Runner.Snapshot(ctx, key, doc)
 	if err != nil {
 		logger.WithError(err).Error("snapshot failed")

@@ -59,6 +59,11 @@ type Runner struct {
 	mu      sync.Mutex
 	closed  bool
 	running map[string]chan struct{}
+	// liveSrc is the source the running live job for a key is following.
+	// The handler's cache is bounded and expiring, and an eviction says
+	// nothing about the job: without this, the next poll of an evicted key
+	// would build a second LiveSource for a session that already has one.
+	liveSrc map[string]*LiveSource
 
 	live     LiveConfig
 	seenMu   sync.Mutex
@@ -72,7 +77,7 @@ func NewRunner(store Store, tr Translator, batchSize, maxJobs int, lockTTL time.
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Runner{store: store, tr: tr, batchSize: batchSize, lockTTL: lockTTL,
 		ctx: ctx, cancel: cancel, sem: make(chan struct{}, maxJobs), running: map[string]chan struct{}{},
-		lastSeen: map[string]time.Time{}}
+		liveSrc: map[string]*LiveSource{}, lastSeen: map[string]time.Time{}}
 	r.SetLive(LiveConfig{})
 	return r
 }
@@ -146,8 +151,18 @@ func (r *Runner) Ensure(_ context.Context, key string, job *Job) {
 		r.mu.Unlock()
 		return
 	}
+	if job.Live != nil && job.Live.RunEnded() {
+		// Nothing to do against this source and nothing that will change
+		// that: the run ended and wrote what it could. A new transcoder
+		// session arrives as a different LiveSource, and that one is work.
+		r.mu.Unlock()
+		return
+	}
 	done := make(chan struct{})
 	r.running[key] = done
+	if job.Live != nil {
+		r.liveSrc[key] = job.Live
+	}
 	// The idle mark belongs to the running entry and is seeded here, under
 	// the same lock: a live job that nobody Touched still has a window to
 	// idle out of, and the mark cannot be seeded before the entry that owns
@@ -164,6 +179,7 @@ func (r *Runner) Ensure(_ context.Context, key string, job *Job) {
 			}
 			r.mu.Lock()
 			delete(r.running, key)
+			delete(r.liveSrc, key)
 			// Dropped in the same critical section as the running entry:
 			// otherwise a Touch+Ensure that got in right after the delete has
 			// its fresh mark erased here, and the job it started would read
@@ -191,6 +207,16 @@ func (r *Runner) Ensure(_ context.Context, key string, job *Job) {
 		// runs on the runner's own context rather than the request's.
 		r.run(r.ctx, key, job)
 	}()
+}
+
+// LiveSource is the source the live job for key is following, or nil when
+// no live job for it is running in this process. The handler asks when its
+// own cache does not have the key: the cache is bounded and expiring, and
+// an entry going away is not a reason to start following the session twice.
+func (r *Runner) LiveSource(key string) *LiveSource {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.liveSrc[key]
 }
 
 // Wait blocks until the in-process goroutine for key exits. No-op when

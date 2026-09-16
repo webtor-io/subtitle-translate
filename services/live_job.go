@@ -225,25 +225,47 @@ func alignLines(p *Progress, doc *Doc) []string {
 
 // syncLive lines p up with the document as it stands: every cue currently
 // in the document gets its key and its (re-aligned) translation at its own
-// index. Entries past the document are left alone rather than trimmed —
-// they were paid for, readers are index-driven and bounds-checked, and a
-// document that shrank may well grow back.
+// index.
+//
+// Translations the new layout displaces are parked past the document
+// instead of being written over. A source does not always start where the
+// last one did — a resume, a reload, a session swap, an evicted cache entry
+// all produce a document that begins mid-film — and then the cue at index 0
+// is not the cue index 0 was filed under. Overwriting in place destroyed the
+// head of the record: keys replaced, lines blanked, cues someone had already
+// paid to translate bought again on the next contiguous viewing.
+//
+// Parked entries are invisible to every reader of the document (RenderByIndex,
+// countDoneByIndex and pendingByTime all index by a document cue's own Index,
+// which is always below len(doc.Cues)) and visible to collectKnown, which is
+// the one that has to see them: it is what a later run matches against. The
+// record therefore keeps every translation it ever held, whatever order the
+// documents arrive in, and each key appears once.
 func syncLive(p *Progress, doc *Doc) {
 	n := len(doc.Cues)
 	aligned := alignLines(p, doc)
-	for len(p.Lines) < n {
-		p.Lines = append(p.Lines, "")
-	}
-	for len(p.CueKeys) < n {
-		p.CueKeys = append(p.CueKeys, "")
-	}
+	lines := make([]string, n)
+	keys := make([]string, n)
+	inDoc := make(map[string]bool, n)
 	for _, c := range doc.Cues {
 		if c.Index < 0 || c.Index >= n {
 			continue
 		}
-		p.CueKeys[c.Index] = CueKey(c.Start, c.End, c.Lines)
-		p.Lines[c.Index] = aligned[c.Index]
+		k := CueKey(c.Start, c.End, c.Lines)
+		keys[c.Index] = k
+		lines[c.Index] = aligned[c.Index]
+		inDoc[k] = true
 	}
+	for i, k := range p.CueKeys {
+		if k == "" || inDoc[k] || i >= len(p.Lines) || p.Lines[i] == "" {
+			continue
+		}
+		inDoc[k] = true
+		keys = append(keys, k)
+		lines = append(lines, p.Lines[i])
+	}
+	p.CueKeys = keys
+	p.Lines = lines
 	p.Total = n
 }
 
@@ -449,6 +471,17 @@ func (r *Runner) finishLive(ctx context.Context, key string, logger *log.Entry, 
 	if !job.Live.Contiguous() {
 		// This run joined after a seek, so the document has holes no later
 		// reader could detect. The partial stays, the artifact is not written.
+		//
+		// And the run is over: the playlist ended, everything it carried is
+		// translated, and no final will ever be written from it. Without
+		// saying so on the source, every poll of the key found no final and
+		// no running job and started another one — a job that took the lock,
+		// polled an ended playlist, found nothing pending and wrote the same
+		// record again, once per poll per viewer, for as long as the tab
+		// stayed open. The mark lives on the source, so it lasts exactly as
+		// long as the session it describes: the next transcoder session
+		// brings its own LiveSource and is new work.
+		job.Live.MarkRunEnded()
 		logger.Info("live source ended on a run that skipped ahead, keeping the partial")
 		r.stopLive(ctx, key, logger, p)
 		return

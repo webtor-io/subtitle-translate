@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,7 +26,12 @@ type livePlaylistServer struct {
 	segFail   map[string]int
 	segAlways map[string]int
 	hits      map[string]int
-	srv       *httptest.Server
+	// token, when set, is the only value of the ?token= query parameter the
+	// playlist answers: the transcoder session token lives in the query,
+	// and a source that kept fetching the URL it was created with would be
+	// refused once the proxy handed out a renewed one.
+	token string
+	srv   *httptest.Server
 }
 
 func newLivePlaylistServer(t *testing.T) *livePlaylistServer {
@@ -34,7 +41,11 @@ func newLivePlaylistServer(t *testing.T) *livePlaylistServer {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.hits[r.URL.Path]++
-		if r.URL.Path == "/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/s0.m3u8" {
+		if strings.HasSuffix(r.URL.Path, ".m3u8") {
+			if s.token != "" && r.URL.Query().Get("token") != s.token {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
 			if s.status != 200 {
 				w.WriteHeader(s.status)
 				return
@@ -103,7 +114,48 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 }
 
 func (s *livePlaylistServer) url() string {
-	return s.srv.URL + "/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/s0.m3u8?token=T"
+	return s.urlForSession(liveSessionID)
+}
+
+// urlForSession is the same playlist under another transcoder session id.
+// The id lives in the path, which is what makes a session change visible to
+// the handler while a query change is not.
+func (s *livePlaylistServer) urlForSession(id string) string {
+	return s.srv.URL + "/h/a.mkv~hls/session/" + id + "/s0.m3u8?token=T"
+}
+
+// urlWithToken is the same session carrying another token.
+func (s *livePlaylistServer) urlWithToken(tok string) string {
+	return s.srv.URL + "/h/a.mkv~hls/session/" + liveSessionID + "/s0.m3u8?token=" + tok
+}
+
+// urlWithRev is the URL as the player reloads it: the <track> is swapped to
+// ?…&rev=<done> every ~15 s while cues arrive, and torrent-http-proxy copies
+// the raw query into X-Source-Url.
+func (s *livePlaylistServer) urlWithRev(n int) string {
+	return s.url() + "&rev=" + strconv.Itoa(n)
+}
+
+// requireToken makes the playlist answer 403 for any other token.
+func (s *livePlaylistServer) requireToken(tok string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.token = tok
+}
+
+// hitCount reads the request count for one path under the server's own lock:
+// a live job is polling while the test looks.
+func (s *livePlaylistServer) hitCount(path string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hits[path]
+}
+
+const liveSessionID = "0123456789abcdef0123456789abcdef"
+
+// segPath is the request path of one segment of the default session.
+func segPath(name string) string {
+	return "/h/a.mkv~hls/session/" + liveSessionID + "/" + name
 }
 
 const pl1 = "#EXTM3U\n#EXT-X-SESSION-OFFSET:0\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-TARGETDURATION:64\n#EXTINF:63.7,\ns0-0.vtt?token=T\n"

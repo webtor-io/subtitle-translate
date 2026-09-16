@@ -9,7 +9,21 @@ on:
       - 'v*'
 
 jobs:
+  # The image is built from master and deployed from there, so the suite has
+  # to gate the build rather than run beside it: a red test must not reach a
+  # tag that sync.sh will happily roll out.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test ./...
   docker:
+    needs: test
     uses: webtor-io/.github/.github/workflows/docker-multiarch.yml@main
     permissions:
       contents: read
