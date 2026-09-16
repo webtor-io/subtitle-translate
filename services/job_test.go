@@ -507,6 +507,45 @@ func TestLiveRunnerReusesTranslationsAfterTheDocumentShrinks(t *testing.T) {
 	}
 }
 
+// TestLiveSnapshotAlignsStoredLinesByCueKey is a negative control for
+// LiveSnapshot going back to trusting p.Lines positionally: the stored
+// record here carries its two lines in the opposite order from the
+// document's cue order, and only key-based alignment (alignLines) puts
+// each translation under its own cue.
+func TestLiveSnapshotAlignsStoredLinesByCueKey(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl2, map[string]string{"s0-0.vtt": seg0, "s0-1.vtt": seg1})
+	r, st := newLiveRunner(t, &fakeTranslator{}, 50, LiveConfig{PollInterval: time.Hour, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// doc = Макс.[0], Привет.[1], empty[2] ("[door slams]" strips to zero
+	// lines under Normalize).
+	keys := ls.Doc().Keys()
+	p := &Progress{
+		Total:   2,
+		Live:    true,
+		CueKeys: []string{keys[1], keys[0]}, // Привет., then Макс. — reversed
+		Lines:   []string{"PT:Привет.", "PT:Макс."},
+	}
+	if err := st.PutProgress(context.Background(), "k", p); err != nil {
+		t.Fatal(err)
+	}
+	s, err := r.LiveSnapshot(context.Background(), "k", ls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(s.Body)
+	iMaxTime := strings.Index(body, "00:00:45.107") // cue 1 start
+	iMax := strings.Index(body, "PT:Макс.")
+	iHiTime := strings.Index(body, "00:01:03.699 -->") // cue 2 start (unique: cue 1's end time reads "--> 00:01:03.699")
+	iHi := strings.Index(body, "PT:Привет.")
+	if iMaxTime < 0 || iMax < 0 || iHiTime < 0 || iHi < 0 || !(iMaxTime < iMax && iMax < iHiTime && iHiTime < iHi) {
+		t.Fatalf("translations not aligned by cue key: body=%s", body)
+	}
+}
+
 // A job that stopped because its source went away is not live any more,
 // even though the playlist it was reading never said ENDLIST. Reading
 // liveness off the source would leave the client polling a track nobody is

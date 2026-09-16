@@ -241,6 +241,22 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 			// Transient: a timeout, a 5xx, a half-written playlist. The next
 			// tick reads the whole playlist again, so nothing is lost.
 			logger.WithError(err).Warn("failed to refresh the live source")
+			// A transient failure (Refresh runs under its own 30s deadline,
+			// so this is often context.DeadlineExceeded on a slow catch-up)
+			// must not skip the lease refresh or the viewer-gone check: both
+			// have to run every tick, not only on a tick that got a fresh
+			// document.
+			if !r.holdLock(ctx, key, token, logger, &lockedAt) {
+				return
+			}
+			if r.sinceSeen(key) > r.live.Idle {
+				logger.Info("viewer gone, stopping")
+				JobErrors.WithLabelValues("viewer_gone").Inc()
+				// Live stays set: the source has not ended, the translation is
+				// only paused until someone asks for this track again.
+				r.putProgress(ctx, key, logger, p)
+				return
+			}
 			continue
 		}
 		// One snapshot per tick: the cue keys and the cues have to describe

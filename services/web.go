@@ -367,6 +367,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					done++
 				}
 			}
+			// A live record is never truncated when the document shrinks
+			// (see syncLive), so len(p.Lines) can exceed p.Total; clamp so
+			// done never reads as "more than total" (which the player takes
+			// to mean the track is finished).
+			if done > total {
+				done = total
+			}
 		}
 		writeVTT(w, r, nil, done, total, false, false)
 		return

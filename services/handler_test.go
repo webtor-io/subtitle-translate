@@ -190,6 +190,22 @@ func TestHeadProgressPastStructurallyEmptyCue(t *testing.T) {
 	}
 }
 
+// TestHeadClampsProgressToTotal is a negative control for HEAD reporting
+// done > total: a live record can carry more Lines than Total once the
+// document shrinks (syncLive no longer truncates the tail), and a player
+// that sees done >= total treats the track as finished.
+func TestHeadClampsProgressToTotal(t *testing.T) {
+	h, src := newHandlerForTest(t, &fakeTranslator{}, vttWith(2))
+	key := ArtifactKey("abc", KeyPath("/movie.srt~vtt/movie.vtt"), "pt", h.Model, PromptVersion)
+	if err := h.Runner.store.PutProgress(context.Background(), key, &Progress{Total: 1, Lines: []string{"a", "b", "c"}}); err != nil {
+		t.Fatal(err)
+	}
+	rec := do(h, "HEAD", "/abc/movie.vtt~tr:pt/movie.vtt", src.URL)
+	if rec.Code != 200 || rec.Header().Get("X-Subtitle-Progress") != "1/1" {
+		t.Fatalf("progress must clamp to total: code=%d progress=%s", rec.Code, rec.Header().Get("X-Subtitle-Progress"))
+	}
+}
+
 func TestParseNamesTruncatesByRunesAndCapsCount(t *testing.T) {
 	long := strings.Repeat("Ж", 45) // 45-rune Cyrillic name, over the 40-rune cap
 	got := ParseNames(long)
