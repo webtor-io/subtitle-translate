@@ -132,3 +132,70 @@ func TestLiveSourceGoneAndTooLarge(t *testing.T) {
 		t.Fatalf("want gone, got %v", err)
 	}
 }
+
+// TestLiveSourceCumulativeBytesCap exercises the cumulative-bytes check in
+// Refresh's segment loop (s.doc.Bytes()+len(body) > s.maxBytes), not the
+// per-fetch limit in get(). The cap must sit above the playlist body and
+// above either segment alone, but below their combined size, so the first
+// segment is accepted and the second is refused only once its bytes would
+// push the running total over the cap.
+//
+// This cannot use the package-level pl2 fixture: pl2 is 169 bytes, more
+// than len(seg0)+len(seg1) (126 bytes), so no cap value can sit below the
+// combined segment size and still above the playlist body — the playlist
+// fetch itself would trip get()'s per-fetch limit first. miniPl carries
+// the same two segments with a leaner body so the combined-segments cap
+// is reachable.
+func TestLiveSourceCumulativeBytesCap(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	miniPl := "#EXTM3U\n#EXT-X-SESSION-OFFSET:0\n#EXTINF:1,\ns0-0.vtt\n#EXTINF:1,\ns0-1.vtt\n"
+	srv.set(miniPl, map[string]string{"s0-0.vtt": seg0, "s0-1.vtt": seg1})
+
+	maxBytes := int64(len(miniPl))
+	if int64(len(seg0)) > maxBytes {
+		maxBytes = int64(len(seg0))
+	}
+	if int64(len(seg1)) > maxBytes {
+		maxBytes = int64(len(seg1))
+	}
+	maxBytes++
+	if maxBytes >= int64(len(seg0)+len(seg1)) {
+		t.Fatalf("fixture invalid: maxBytes=%d must stay below len(seg0)+len(seg1)=%d", maxBytes, len(seg0)+len(seg1))
+	}
+
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), maxBytes, 5000)
+	_, err := ls.Refresh(context.Background())
+	if !errors.Is(err, ErrSourceTooLarge) {
+		t.Fatalf("want too large, got %v", err)
+	}
+
+	// The first segment (s0-0, in playlist order) fit under the cap and was
+	// accepted; the second (s0-1) was refused by the cumulative-bytes check
+	// before ever reaching AddSegment. Only the first segment's cues should
+	// be in the doc.
+	want := NewLiveDoc()
+	if _, werr := want.AddSegment(0, []byte(seg0)); werr != nil {
+		t.Fatal(werr)
+	}
+	if got := ls.Doc().Len(); got != want.Len() {
+		t.Fatalf("doc len=%d, want %d (only the first segment's cues)", got, want.Len())
+	}
+}
+
+// TestLiveSourceCueCap exercises the cue-count check in Refresh's segment
+// loop (s.doc.Len() > s.maxCues), which runs after AddSegment: the segment
+// that pushes the count over the cap is already merged into the doc by the
+// time Refresh returns the error. This documents that ruled behavior.
+func TestLiveSourceCueCap(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl2, map[string]string{"s0-0.vtt": seg0, "s0-1.vtt": seg1})
+
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 1) // cap at 1 cue
+	_, err := ls.Refresh(context.Background())
+	if !errors.Is(err, ErrSourceTooLarge) {
+		t.Fatalf("want too large, got %v", err)
+	}
+	if got := ls.Doc().Len(); got != 3 {
+		t.Fatalf("doc len=%d, want 3 (cap checked after AddSegment already applied it)", got)
+	}
+}
