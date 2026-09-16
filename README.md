@@ -106,7 +106,7 @@ a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
   first read to `#EXT-X-ENDLIST`. A viewer who seeks gets a partial translation
   for the session (kept in Redis for 24 h under the same key, reused by cue
   identity on the next session); the next contiguous viewing completes it.
-- After a seek, the cues of the current run are translated before the backlog of earlier runs.
+- After a seek, cues at or after the current position are translated before the backlog behind it.
 - The job stops on its own when nobody polled the key for `--live-idle`:
   reading the playlist keeps the transcoder session alive, so an unwatched
   translation would otherwise transcode the whole file for nobody. It also stops

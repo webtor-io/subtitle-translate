@@ -274,34 +274,40 @@ func syncLive(p *Progress, doc *Doc) {
 	p.Total = n
 }
 
-// pendingByTime returns the cues still needing a translation: the cues of
-// the run currently at the front of the playlist first (earliest first),
-// then every other pending cue, earliest first. Indexes are Cue.Index,
-// texts are the joined source lines.
+// pendingByTime returns the cues still needing a translation: those at or
+// ahead of the playhead first (earliest first), then the backlog behind it,
+// earliest first. Indexes are Cue.Index, texts are the joined source lines.
 //
 // current is the offset of the run the playlist is on right now
-// (LiveSource.CurrentOffset). Ordering by document time alone put every
+// (LiveSource.CurrentOffset), compared against each cue's own Start rather
+// than its ingest run (Cue.Run): ordering by document time alone put every
 // pending cue of an abandoned earlier run ahead of the new position after a
 // seek — there can be hundreds of them — so the cue playing right now waited
-// out the whole backlog before it was even queued. A cue's own Run (set by
-// LiveDoc.Snapshot) says which run it belongs to; matching it against
-// current is what lets the run in progress cut the line.
+// out the whole backlog before it was even queued. Matching by ingest run
+// instead of position would still misfire — #EXT-X-SESSION-OFFSET is
+// quantized to 30 s, so a seek to 200 s starts a run at offset 180 while
+// cues covering 180-240 s can already sit in the document tagged with an
+// EARLIER run's offset, ingested before the seek while that run was still
+// playing forward — deprioritizing cues that in fact sit at the new
+// position. A run that resumes at an offset it already covered changes
+// nothing here either: Refresh's `seen` map makes that a no-op, so there is
+// nothing new to reorder.
 func pendingByTime(doc *Doc, lines []string, current time.Duration) ([]int, []string) {
-	var curIdx, restIdx []int
-	var curTexts, restTexts []string
+	var aheadIdx, behindIdx []int
+	var aheadTexts, behindTexts []string
 	for _, c := range doc.Cues {
 		if len(c.Lines) == 0 || c.Index < 0 || c.Index >= len(lines) || lines[c.Index] != "" {
 			continue
 		}
-		if c.Run == current {
-			curIdx = append(curIdx, c.Index)
-			curTexts = append(curTexts, JoinLines(c))
+		if c.Start >= current {
+			aheadIdx = append(aheadIdx, c.Index)
+			aheadTexts = append(aheadTexts, JoinLines(c))
 		} else {
-			restIdx = append(restIdx, c.Index)
-			restTexts = append(restTexts, JoinLines(c))
+			behindIdx = append(behindIdx, c.Index)
+			behindTexts = append(behindTexts, JoinLines(c))
 		}
 	}
-	return append(curIdx, restIdx...), append(curTexts, restTexts...)
+	return append(aheadIdx, behindIdx...), append(aheadTexts, behindTexts...)
 }
 
 // runLive translates a playlist that is still being written. It holds the

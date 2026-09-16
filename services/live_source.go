@@ -85,10 +85,11 @@ type LiveSource struct {
 	// last longer than a poll interval.
 	lastAttempt time.Time
 	// currentOffset is the #EXT-X-SESSION-OFFSET of the most recent
-	// successful playlist read: which run pendingByTime should translate
-	// first when a seek has left an earlier run's cues still untranslated.
-	// A failed attempt leaves it as it was — nothing about the current run
-	// changed, only the attempt to confirm it failed.
+	// successful playlist read: the playhead pendingByTime compares each
+	// pending cue's Start against, so cues at or ahead of it are translated
+	// before the backlog behind it. A failed attempt leaves it as it was —
+	// nothing about the current position changed, only the attempt to
+	// confirm it failed.
 	currentOffset time.Duration
 }
 
@@ -169,8 +170,9 @@ func (s *LiveSource) RunEnded() bool {
 }
 
 // CurrentOffset is the #EXT-X-SESSION-OFFSET the most recent successful
-// playlist read reported. pendingByTime uses it to translate the run the
-// playlist is currently on before the backlog of any run it left behind.
+// playlist read reported — the playhead pendingByTime compares each
+// pending cue's Start against, translating what is at or ahead of it
+// before the backlog behind it.
 func (s *LiveSource) CurrentOffset() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()

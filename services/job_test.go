@@ -371,25 +371,24 @@ func countFilled(lines []string) int {
 	return n
 }
 
-// TestPendingByTimeCurrentRunFirst pins pendingByTime's ordering directly:
-// given a document mixing untranslated cues from an abandoned run (offset 0)
-// with cues from the run the playlist is now on (offset 600), the returned
-// order must start with every run-600 cue before any run-0 cue, regardless
-// of movie time. Reverting to plain document-time order (dropping the
-// current-run split) puts the run-0 cues first and reddens this test.
-func TestPendingByTimeCurrentRunFirst(t *testing.T) {
+// TestPendingByTimeAheadOfPlayheadFirst pins pendingByTime's ordering
+// directly: given a document mixing an untranslated backlog at 0-100 s with
+// cues at 600 s and later, current=600 s must return every cue at or after
+// 600 s before any backlog cue, regardless of ingest run. Reverting to plain
+// document-time order (dropping the ahead/behind split) puts the backlog
+// first and reddens this test.
+func TestPendingByTimeAheadOfPlayheadFirst(t *testing.T) {
 	cue := func(i, sec int, run time.Duration, text string) Cue {
 		return Cue{Index: i, Start: time.Duration(sec) * time.Second, End: time.Duration(sec+1) * time.Second, Lines: []string{text}, Run: run}
 	}
-	// Already in movie-time order, as LiveDoc.Snapshot produces: the run-0
-	// backlog (early movie time) sorts ahead of the run-600 cues (600s+) by
-	// time alone.
+	// Already in movie-time order, as LiveDoc.Snapshot produces: the 0-100 s
+	// backlog sorts ahead of the 600 s+ cues by time alone.
 	doc := &Doc{Cues: []Cue{
 		cue(0, 0, 0, "a"),
-		cue(1, 1, 0, "b"),
-		cue(2, 2, 0, "c"),
-		cue(3, 601, 600*time.Second, "x"),
-		cue(4, 602, 600*time.Second, "y"),
+		cue(1, 50, 0, "b"),
+		cue(2, 100, 0, "c"),
+		cue(3, 600, 600*time.Second, "x"),
+		cue(4, 650, 600*time.Second, "y"),
 	}}
 	lines := make([]string, len(doc.Cues))
 	idx, texts := pendingByTime(doc, lines, 600*time.Second)
@@ -397,17 +396,50 @@ func TestPendingByTimeCurrentRunFirst(t *testing.T) {
 		t.Fatalf("idx=%v, want all 5 cues pending", idx)
 	}
 	if idx[0] != 3 || idx[1] != 4 {
-		t.Fatalf("the current run (offset 600) must lead: idx=%v", idx)
+		t.Fatalf("cues at/after the current position must lead: idx=%v", idx)
 	}
 	if idx[2] != 0 || idx[3] != 1 || idx[4] != 2 {
-		t.Fatalf("the backlog must keep its own time order behind the current run: idx=%v", idx)
+		t.Fatalf("the backlog must keep its own time order behind the current position: idx=%v", idx)
 	}
 	if texts[0] != "x" || texts[1] != "y" {
 		t.Fatalf("texts must track idx: %v", texts)
 	}
 }
 
-// TestLiveRunnerTranslatesCurrentRunFirstAfterSeek is the runner-level
+// TestPendingByTimeAheadOfPlayheadWinsAcrossIngestRuns is the guard on why
+// pendingByTime compares Cue.Start against current rather than Cue.Run:
+// #EXT-X-SESSION-OFFSET is quantized to 30 s, so a seek to 200 s starts a
+// run at offset 180 while cues covering 180-240 s can already sit in the
+// document tagged with an EARLIER run's offset (150) — ingested before the
+// seek, while the viewer was still watching that run play forward. Matching
+// by ingest run would deprioritize exactly the cues at the new position;
+// matching by Start does not.
+func TestPendingByTimeAheadOfPlayheadWinsAcrossIngestRuns(t *testing.T) {
+	cue := func(i, sec int, run time.Duration, text string) Cue {
+		return Cue{Index: i, Start: time.Duration(sec) * time.Second, End: time.Duration(sec+1) * time.Second, Lines: []string{text}, Run: run}
+	}
+	doc := &Doc{Cues: []Cue{
+		cue(0, 50, 0, "old"),               // behind the seek target: trails
+		cue(1, 180, 150*time.Second, "p1"), // at the new playhead, ingested under run 150
+		cue(2, 240, 150*time.Second, "p2"), // ahead of it, same (earlier) ingest run
+	}}
+	lines := make([]string, len(doc.Cues))
+	idx, texts := pendingByTime(doc, lines, 180*time.Second)
+	if len(idx) != 3 {
+		t.Fatalf("idx=%v, want all 3 cues pending", idx)
+	}
+	if idx[0] != 1 || idx[1] != 2 {
+		t.Fatalf("cues at/after the playhead must lead despite their ingest run: idx=%v", idx)
+	}
+	if idx[2] != 0 {
+		t.Fatalf("the cue behind the playhead must trail: idx=%v", idx)
+	}
+	if texts[0] != "p1" || texts[1] != "p2" {
+		t.Fatalf("texts must track idx: %v", texts)
+	}
+}
+
+// TestLiveRunnerTranslatesAheadOfPlayheadFirstAfterSeek is the runner-level
 // reproduction of the reported bug: after a seek, hundreds of untranslated
 // cues can be left behind by the abandoned run, and ordering pending work by
 // document time alone spent every batch on that backlog before the cue
@@ -418,7 +450,7 @@ func TestPendingByTimeCurrentRunFirst(t *testing.T) {
 // (#EXT-X-ENDLIST), which flushes everything pending in one batch, and it is
 // that batch's own line order — recorded via fakeTranslator.requests — that
 // pins the fix.
-func TestLiveRunnerTranslatesCurrentRunFirstAfterSeek(t *testing.T) {
+func TestLiveRunnerTranslatesAheadOfPlayheadFirstAfterSeek(t *testing.T) {
 	srv := newLivePlaylistServer(t)
 	srv.set(pl1, map[string]string{"s0-0.vtt": vttWith(4)})
 	tr := &fakeTranslator{}
@@ -448,7 +480,7 @@ func TestLiveRunnerTranslatesCurrentRunFirstAfterSeek(t *testing.T) {
 		t.Fatalf("want all 5 pending cues in the one batch, got %d: %v", len(reqs[0]), reqs[0])
 	}
 	if reqs[0][0] != "seeked line" {
-		t.Fatalf("the current run's cue must lead the batch, got %v", reqs[0])
+		t.Fatalf("the cue ahead of the playhead must lead the batch, got %v", reqs[0])
 	}
 	if p, _ := st.GetProgress(context.Background(), "k"); p == nil || p.Live || p.Status != statusDone {
 		t.Fatalf("seeked run reaching ENDLIST must record Status=done: %+v", p)

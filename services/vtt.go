@@ -19,11 +19,13 @@ type Cue struct {
 	End   time.Duration
 	Lines []string
 	// Run is the #EXT-X-SESSION-OFFSET of the live run this cue came from;
-	// zero for a file source, which has no runs. pendingByTime uses it to
-	// prioritize the run the playlist is currently on: after a seek, the
-	// abandoned run's untranslated cues sort earlier by movie time than
-	// anything at the new position, and time order alone would spend every
-	// batch on that backlog before the cue playing now is even queued.
+	// zero for a file source, which has no runs. Diagnostic only — it says
+	// which ingest run produced the cue, not where the cue sits relative to
+	// the playhead: #EXT-X-SESSION-OFFSET is quantized to 30 s, so a run
+	// covering movie time 180-240 s can be tagged with an earlier offset
+	// than a fresh seek landing in that same neighborhood. pendingByTime
+	// prioritizes by Cue.Start against the current offset instead; see its
+	// doc comment.
 	Run time.Duration
 }
 
