@@ -125,10 +125,14 @@ func ParseNames(q string) []string {
 // polls the same URL every few seconds while the job runs, and the source
 // does not change between polls.
 //
-// liveSourceCacheTTL is longer: a live job can run for the length of a
-// whole movie, and dropping the cached LiveSource mid-playback would
-// restart its accumulated document (and re-fetch every segment) on the
-// next poll instead of reusing what the background job already built.
+// liveSourceCacheTTL is an idle timeout, not a session budget: liveFor
+// Touches the entry on every poll, so the clock only runs once nobody is
+// asking for the key any more. A live job can run for the length of a whole
+// movie, and dropping the cached LiveSource mid-playback would restart its
+// accumulated document (and re-fetch every segment) on the next poll
+// instead of reusing what the background job already built — so the value
+// bounds how long an abandoned session's document stays resident, and does
+// not have to exceed the longest film.
 const (
 	sourceCacheTTL      = 10 * time.Minute
 	liveSourceCacheTTL  = 30 * time.Minute
@@ -146,8 +150,11 @@ type Handler struct {
 	once sync.Once
 	docs *lazymap.LazyMap[*Doc]
 
+	// LiveCacheTTL overrides liveSourceCacheTTL (tests use a short one).
+	LiveCacheTTL time.Duration
+
 	liveOnce sync.Once
-	lives    *lazymap.LazyMap[*LiveSource]
+	lives    *lazymap.LazyMap[*liveEntry]
 }
 
 // docCache holds the parsed source per artifact key. Failures are not
@@ -193,42 +200,74 @@ func isPlaylistSource(u *url.URL) bool {
 	return strings.HasSuffix(strings.ToLower(u.Path), ".m3u8")
 }
 
+// liveEntry is what one artifact key holds: the source being followed now,
+// and the URLs this key has already given up on.
+//
+// The key deliberately survives across transcoder sessions (KeyPath strips
+// the session id), so two viewers of the same file and language share it
+// while holding different session URLs — and a poll carrying a URL this key
+// has retired is a straggler (a reload, a second tab, an in-flight request,
+// another viewer), not news about a new session.
+type liveEntry struct {
+	mu      sync.Mutex
+	cur     *LiveSource
+	retired map[string]bool
+}
+
 // livesCache is docCache's counterpart for live sources.
-func (h *Handler) livesCache() *lazymap.LazyMap[*LiveSource] {
+func (h *Handler) livesCache() *lazymap.LazyMap[*liveEntry] {
 	h.liveOnce.Do(func() {
-		h.lives = lazymap.New[*LiveSource](&lazymap.Config{Expire: liveSourceCacheTTL, Capacity: sourceCacheCapacity})
+		ttl := h.LiveCacheTTL
+		if ttl <= 0 {
+			ttl = liveSourceCacheTTL
+		}
+		h.lives = lazymap.New[*liveEntry](&lazymap.Config{Expire: ttl, Capacity: sourceCacheCapacity})
 	})
 	return h.lives
 }
 
-// liveFor returns the cached LiveSource for key, creating one lazily.
-// NewLiveSource makes no network call, so a HEAD before any GET populates
-// the cache without fetching anything.
+// liveFor returns the LiveSource this key is being served from, creating
+// one lazily. NewLiveSource makes no network call, so a HEAD before any GET
+// populates the cache without fetching anything.
 //
-// key survives across transcoder sessions (KeyPath strips the session id),
-// but each new session serves its playlist at a new URL. Reusing a cached
-// LiveSource built for the old URL would poll a URL that now 404s, ending
-// the job with source_gone while the viewer is mid-session — so a URL
-// mismatch drops the stale entry and starts a fresh source under the same
-// key instead of trusting the cache.
+// A URL that does not match the current source is either a new transcoder
+// session (the old one's playlist now 404s, and a job still polling it has
+// to be told) or a straggler from a session this key already retired. The
+// two are told apart by the retired set: a retired URL is served the
+// current source unchanged, which for a second viewer of the same file is
+// the right content — same film, same cues, same movie time — not a
+// fallback. Resurrecting it instead would retire the live session's source
+// on every poll, killing its job and re-downloading every segment so far.
 func (h *Handler) liveFor(key, sourceURL string) *LiveSource {
 	cache := h.livesCache()
-	newSource := func() (*LiveSource, error) {
-		return NewLiveSource(sourceURL, h.Client, h.MaxSourceBytes, h.MaxCues), nil
+	e, _ := cache.Get(key, func() (*liveEntry, error) {
+		return &liveEntry{cur: NewLiveSource(sourceURL, h.Client, h.MaxSourceBytes, h.MaxCues), retired: map[string]bool{}}, nil
+	})
+	// lazymap arms the expiry timer once, when the entry is created; Get
+	// does not reset it. Touch does, and that is the difference between a
+	// TTL that bounds a session and one that bounds idleness.
+	cache.Touch(key)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	switch {
+	case e.cur.url == sourceURL:
+	case e.retired[sourceURL] && !e.cur.Gone():
+		// A straggler for a session this key gave up on, while the session
+		// it moved to is still alive: serve the current source. Gone is the
+		// transcoder's verdict on the playlist, not our own bookkeeping —
+		// a source we merely retired never counts as evidence here, or the
+		// first straggler after a swap would swap straight back.
+	default:
+		// Retire before replacing: a job may still be mid-poll against the
+		// old source (Ensure is a no-op while a job for key is already
+		// running, so this request's own Ensure will not replace it), and
+		// without this it would keep polling a dead URL for up to one more
+		// PollInterval — plus any in-flight batch — before noticing.
+		e.cur.Retire()
+		e.retired[e.cur.url] = true
+		e.cur = NewLiveSource(sourceURL, h.Client, h.MaxSourceBytes, h.MaxCues)
 	}
-	src, _ := cache.Get(key, newSource)
-	if src.url != sourceURL {
-		// Retire before dropping: a job may still be mid-poll against the
-		// stale source (Ensure is a no-op while a job for key is already
-		// running, so this request's own Ensure below will not replace it),
-		// and without this it would keep polling the dead URL for up to one
-		// more PollInterval — plus any in-flight batch — before noticing on
-		// its own.
-		src.Retire()
-		cache.Drop(key)
-		src, _ = cache.Get(key, newSource)
-	}
-	return src
+	return e.cur
 }
 
 // Client-facing bodies. The real cause is logged and never written to the
@@ -300,46 +339,62 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Runner.Touch(key)
 
 	if u, perr := url.Parse(sourceURL); perr == nil && isPlaylistSource(u) {
+		// Same scheme guard as fetchDoc, and for the same reason: the
+		// source URL arrives in a header, and file:// and friends would be
+		// read by the transport as local or intranet resources. Before the
+		// cache, so a rejected URL never becomes the source a key follows.
+		if u.Scheme != "http" && u.Scheme != "https" {
+			logger.WithField("scheme", u.Scheme).Warn("unsupported live source scheme")
+			http.Error(w, msgBadRequest, http.StatusBadRequest)
+			return
+		}
 		src := h.liveFor(key, sourceURL)
+		// Every poll, GET and HEAD alike, refreshes a source nobody has
+		// read for a poll interval. The background job only runs on the
+		// replica that won the store lock; on every other one this is the
+		// only thing that advances the document being served, and on the
+		// owning one it is a no-op because the loop has just refreshed the
+		// same object. It also subsumes the old "prime while the document
+		// is empty" read: the first response still carries whatever cues
+		// exist.
+		//
+		// The source is cached and shared with whoever polls this key next,
+		// so — like docFor's fetch — this read must not die with this
+		// request's own connection.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sourceFetchTimeout)
+		_, rerr := src.RefreshIfStale(rctx, h.Runner.LivePollInterval())
+		cancel()
+		if rerr != nil {
+			switch {
+			case errors.Is(rerr, ErrSourceGone):
+				logger.WithError(rerr).Warn("live source unavailable")
+				http.Error(w, msgSourceUnavail, http.StatusNotFound)
+				return
+			case errors.Is(rerr, ErrSourceTooLarge):
+				logger.WithError(rerr).Warn("live source outgrew its caps")
+				http.Error(w, msgSourceTooLarge, http.StatusRequestEntityTooLarge)
+				return
+			default:
+				// Transient: a timeout on a cold catch-up, a 502 from the
+				// proxy, a half-written playlist. Not an answer about the
+				// track, so it must not be reported as one — the job retries
+				// on its own tick and the client keeps polling what is known.
+				logger.WithError(rerr).Warn("failed to refresh the live source, serving what is known")
+			}
+		}
 		if r.Method == http.MethodHead {
 			// HEAD never starts the job (same contract as the regular
 			// source below): it reports what is known without triggering
-			// or waiting on a translation.
-			snap, err := h.Runner.LiveSnapshot(ctx, key, src)
+			// or waiting on a translation. It also never renders — the body
+			// would be built and dropped on every poll of every viewer.
+			done, total, live, err := h.Runner.LiveProgress(ctx, key, src)
 			if err != nil {
-				logger.WithError(err).Error("live snapshot failed")
+				logger.WithError(err).Error("live progress failed")
 				http.Error(w, msgUpstreamUnavail, http.StatusBadGateway)
 				return
 			}
-			writeVTTLive(w, r, nil, snap)
+			writeVTT(w, r, nil, done, total, false, live)
 			return
-		}
-		// A fresh source has nothing yet: one synchronous read here means
-		// the first response already carries whatever cues exist, and a
-		// gone/oversize source is reported to this request the same way a
-		// regular source's fetch failure is, instead of surfacing only on
-		// the background job's next tick.
-		if src.Doc().Len() == 0 {
-			// The source is cached and shared with whoever polls this key
-			// next, so — like docFor's fetch — this priming read must not
-			// die with this request's own connection.
-			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sourceFetchTimeout)
-			_, rerr := src.Refresh(rctx)
-			cancel()
-			if rerr != nil {
-				switch {
-				case errors.Is(rerr, ErrSourceGone):
-					logger.WithError(rerr).Warn("live source unavailable")
-					http.Error(w, msgSourceUnavail, http.StatusNotFound)
-				case errors.Is(rerr, ErrSourceTooLarge):
-					logger.WithError(rerr).Warn("live source outgrew its caps")
-					http.Error(w, msgSourceTooLarge, http.StatusRequestEntityTooLarge)
-				default:
-					logger.WithError(rerr).Warn("live source unavailable")
-					http.Error(w, msgSourceUnavail, http.StatusNotFound)
-				}
-				return
-			}
 		}
 		h.Runner.Ensure(ctx, key, &Job{Lang: lang, SourceLang: r.URL.Query().Get("srclang"), Glossary: ParseNames(r.URL.Query().Get("names")), Live: src})
 		snap, err := h.Runner.LiveSnapshot(ctx, key, src)

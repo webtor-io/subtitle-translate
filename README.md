@@ -11,7 +11,7 @@ The service is reached as a Matryoshka mod on the subtitle URL:
 /<...>~tr:<lang>/<name>.vtt
 ```
 
-`<lang>` is a 2-letter code (see below). THP does not forward the mod extra to the handler, so the target language is parsed back out of the request path.
+`<lang>` is a 2-letter code (see below). THP strips the mod segment from the path it forwards and sends its argument as `X-Mod-Extra` (`~tr:pt` → `pt`), which is what the handler reads; parsing the language back out of the request path is the fallback for a direct call, which keeps the full path.
 
 Request headers (set by the proxy chain):
 
@@ -52,7 +52,7 @@ Error bodies are fixed strings (`bad request`, `source unavailable`, `source too
 
 A `GET` starts (or resumes) the background job for the key if one isn't already running, and returns the current snapshot immediately (cached final artifact, or the cues translated so far). Callers poll the same URL until `X-Subtitle-Progress` reports done. The parsed source is cached in-process for 10 minutes per key, so polling costs one source fetch, not one per poll.
 
-At most `--max-jobs` translations run at once per replica; further keys are registered immediately and start as slots free up.
+At most `--max-jobs` translations run at once per replica (`--live-max-jobs` for live ones, counted separately); further keys are registered immediately and start as slots free up.
 
 ## Live HLS source
 
@@ -67,7 +67,9 @@ a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
 - `X-Subtitle-Live: 1` is set while the playlist is live (no `#EXT-X-ENDLIST`)
   or the job is still writing. Do not read `done == total` as complete while it
   is present. The body carries the translated cues only: a cue not translated
-  yet is omitted, never shown in the source language.
+  **yet** is omitted rather than shown in the source language. A cue the model
+  refused or answered with the wrong line count is the exception — it keeps its
+  source text and counts as done, exactly as on the file path.
 - The final artifact is written only for a contiguous run — offset 0 from the
   first read to `#EXT-X-ENDLIST`. A viewer who seeks gets a partial translation
   for the session (kept in Redis for 24 h under the same key, reused by cue
@@ -78,6 +80,19 @@ a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
   when the session is gone (404/503 from the transcoder), keeping progress.
 - Size caps apply to the accumulated document: `--max-source-bytes` to the sum
   of segment bytes, `--max-cues` to the cue count.
+- Cue identity is the cue's text plus a 3-second time window, not an exact
+  timestamp: the transcoder reports the requested (30 s-quantized) seek as
+  `#EXT-X-SESSION-OFFSET` but starts each run at the keyframe at or before it,
+  so every run's timeline is offset by up to one GOP (measured: 1.657 s between
+  two runs of the same file). A translated cue therefore carries the timing of
+  the run that first produced it, and after a seek it can sit up to a GOP away
+  from the player's own timeline — the same as every side-loaded track on this
+  platform today. Without the window the replayed range is translated and
+  rendered twice.
+- Live jobs are bounded by `--live-max-jobs`, separately from `--max-jobs`: a
+  live job holds its slot for the length of a film while doing almost nothing,
+  so queueing it behind offline work (or offline work behind it) is the wrong
+  trade.
 
 ## What survives the round trip
 
@@ -151,6 +166,7 @@ GLOBAL OPTIONS:
    --live-poll-interval value          how often a live HLS subtitle playlist is re-read, seconds (default: 4) [$SUBTITLE_TRANSLATE_LIVE_POLL_INTERVAL]
    --live-batch-wait value             longest a pending live cue waits before a batch smaller than --batch-size is sent, seconds (default: 10) [$SUBTITLE_TRANSLATE_LIVE_BATCH_WAIT]
    --live-idle value                   a live job stops when nobody polled its key for this long, seconds (default: 90) [$SUBTITLE_TRANSLATE_LIVE_IDLE]
+   --live-max-jobs value               live translation jobs running at once in this replica, bounded separately from --max-jobs (default: 16) [$SUBTITLE_TRANSLATE_LIVE_MAX_JOBS]
    --help, -h                          show help
    --version, -v                       print the version
 ```
@@ -166,7 +182,7 @@ Served when `--use-prom` is set.
 | `subtitle_translate_tokens_output_total` | counter | Upstream output tokens consumed. |
 | `subtitle_translate_batches_fallback_total{reason}` | counter | Batches (or split halves) whose cues kept their source text, by `reason`: `mismatch`, `truncated`, `refusal`. |
 | `subtitle_translate_job_errors_total{code}` | counter | Job errors by cause (`panic`, `store`, `upstream`, `render`, `truncated`, `refusal`, `lock_lost`, `too_large`, `source_gone`, `viewer_gone`). `source_gone` and `viewer_gone` are live-job terminations, not failures: the transcoder session ended or nobody polled the key for `--live-idle` — expected outcomes of a live translation, not something to page on. |
-| `subtitle_translate_jobs_running` | gauge | Translation jobs holding a concurrency slot (`--max-jobs` bounds it). |
+| `subtitle_translate_jobs_running` | gauge | Translation jobs holding a concurrency slot (`--max-jobs` bounds the offline ones, `--live-max-jobs` the live ones). |
 | `subtitle_translate_job_seconds` | histogram | End-to-end duration of a finished translation job. |
 | `subtitle_translate_line_mismatch_total` | counter | Upstream replies whose line count didn't match the batch (retried once, then the original text is kept). |
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -468,8 +469,7 @@ func TestHandlerLiveNewSessionReplacesStaleSource(t *testing.T) {
 	}
 	// The cache must already hold the new source: liveFor replaces a
 	// mismatched URL synchronously, within this same request.
-	src, _ := h.lives.Get(key, func() (*LiveSource, error) { t.Fatal("must already be cached"); return nil, nil })
-	if src.url != srv2.url() {
+	if src := liveCur(t, h, key); src.url != srv2.url() {
 		t.Fatalf("stale source kept: %s", src.url)
 	}
 
@@ -501,5 +501,210 @@ func TestHandlerLiveGoneSourceIs404(t *testing.T) {
 	rec := doLive(h, "GET", srv.url())
 	if rec.Code != 404 || rec.Body.String() != msgSourceUnavail+"\n" {
 		t.Fatalf("code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+// newLiveHandlerOn builds another replica: its own Runner and live source
+// cache over a store (and a transcoder) it shares with the first one.
+func newLiveHandlerOn(t *testing.T, st Store, srv *livePlaylistServer, tr Translator) *Handler {
+	t.Helper()
+	r := NewRunner(st, tr, 3, 4, time.Minute)
+	r.SetLive(LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: 20 * time.Millisecond, Idle: time.Minute})
+	t.Cleanup(r.Close)
+	return &Handler{Runner: r, Model: "m", Client: srv.srv.Client(), MaxSourceBytes: 1 << 20, MaxCues: 5000}
+}
+
+// liveCur is the source a key is being served from, read without creating
+// or touching the cache entry: a probe that resurrected an expired entry
+// (or slid its TTL) would answer its own question.
+func liveCur(t *testing.T, h *Handler, key string) *LiveSource {
+	t.Helper()
+	e, err := h.livesCache().Get(key, func() (*liveEntry, error) { return nil, errors.New("not cached") })
+	if err != nil || e == nil {
+		t.Fatalf("no live entry cached for the key: %v", err)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cur
+}
+
+// liveTotal is the total of X-Subtitle-Progress (done/total).
+func liveTotal(t *testing.T, rec *httptest.ResponseRecorder) int {
+	t.Helper()
+	p := rec.Header().Get("X-Subtitle-Progress")
+	_, tot, ok := strings.Cut(p, "/")
+	if !ok {
+		t.Fatalf("malformed progress header %q", p)
+	}
+	n, err := strconv.Atoi(tot)
+	if err != nil {
+		t.Fatalf("malformed progress header %q", p)
+	}
+	return n
+}
+
+// TestHandlerLiveGrowsOnTheReplicaWithoutTheLock is the two-replica shape:
+// one store, two Handlers with a Runner each. The first GET on A starts the
+// job and A holds the store lock, so B's own job exits at once — nothing
+// but B's handler can keep B's source growing. B must still see the
+// document grow, which is what refreshing on staleness (rather than only
+// while the document is empty) buys.
+func TestHandlerLiveGrowsOnTheReplicaWithoutTheLock(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0, "s0-1.vtt": seg1})
+	st := NewMemoryStore()
+	a := newLiveHandlerOn(t, st, srv, &fakeTranslator{})
+	b := newLiveHandlerOn(t, st, srv, &fakeTranslator{})
+
+	if rec := doLive(a, "GET", srv.url()); rec.Code != 200 {
+		t.Fatalf("A: code=%d", rec.Code)
+	}
+	rec := doLive(b, "GET", srv.url())
+	if rec.Code != 200 {
+		t.Fatalf("B: code=%d", rec.Code)
+	}
+	first := liveTotal(t, rec)
+	if first == 0 {
+		t.Fatal("B primed nothing")
+	}
+
+	srv.set(pl2, nil)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rec := doLive(b, "GET", srv.url())
+		if got := liveTotal(t, rec); got > first {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("B's document stayed at %d cues: the handler never refreshed the source it serves", first)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestHandlerLiveStragglerPollKeepsTheCurrentSource is the two-viewers /
+// one-key shape: the artifact key strips the session id, so a poll carrying
+// a session URL this key has already retired is a straggler — a reload, a
+// second tab, another viewer — not a new session. It must be served the
+// current source, and must not retire it: retiring kills the live session's
+// job and re-downloads every segment so far, once per straggler poll.
+func TestHandlerLiveStragglerPollKeepsTheCurrentSource(t *testing.T) {
+	h, srv1 := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv1.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	srv2 := newLivePlaylistServer(t)
+	srv2.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	key := ArtifactKey("abc", "/a.mkv~hls/s0.m3u8", "pt", "m", PromptVersion)
+
+	doLive(h, "GET", srv1.url())
+	doLive(h, "GET", srv2.url())
+	current := liveCur(t, h, key)
+	if current.url != srv2.url() {
+		t.Fatalf("new session not installed: %s", current.url)
+	}
+
+	// The straggler.
+	if rec := doLive(h, "GET", srv1.url()); rec.Code != 200 {
+		t.Fatalf("straggler: code=%d", rec.Code)
+	}
+	if got := liveCur(t, h, key); got != current {
+		t.Fatalf("straggler replaced the current source: %s", got.url)
+	}
+	if _, err := current.Refresh(context.Background()); err != nil {
+		t.Fatalf("straggler retired the current source: %v", err)
+	}
+}
+
+// TestHandlerLiveSwapsBackOnceTheCurrentSourceIsGone is the other half of
+// the same rule: a retired URL is served the current source only while that
+// source is alive. Once the transcoder has 404'd it, the retired URL is the
+// only live session anyone has offered, and refusing it forever would leave
+// the key stuck on a dead playlist.
+func TestHandlerLiveSwapsBackOnceTheCurrentSourceIsGone(t *testing.T) {
+	h, srv1 := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv1.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	srv2 := newLivePlaylistServer(t)
+	srv2.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	key := ArtifactKey("abc", "/a.mkv~hls/s0.m3u8", "pt", "m", PromptVersion)
+
+	doLive(h, "GET", srv1.url())
+	doLive(h, "GET", srv2.url())
+
+	srv2.mu.Lock()
+	srv2.status = 404
+	srv2.mu.Unlock()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if rec := doLive(h, "GET", srv2.url()); rec.Code == 404 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the gone session never reported 404")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !liveCur(t, h, key).Gone() {
+		t.Fatal("a 404 on the playlist must mark the source gone")
+	}
+
+	if rec := doLive(h, "GET", srv1.url()); rec.Code != 200 {
+		t.Fatalf("swap back: code=%d", rec.Code)
+	}
+	if got := liveCur(t, h, key); got.url != srv1.url() {
+		t.Fatalf("key stayed on the dead session: %s", got.url)
+	}
+}
+
+// TestHandlerLiveCacheTTLSlidesWithEveryPoll pins the absolute-vs-idle TTL
+// question: lazymap arms its expiry timer once, when the entry is created,
+// so without a Touch on every access a session outliving the TTL loses its
+// accumulated document mid-playback — and with it the job that was growing
+// it. Three gaps of more than half the TTL outlive a fixed TTL and do not
+// outlive a sliding one.
+func TestHandlerLiveCacheTTLSlidesWithEveryPoll(t *testing.T) {
+	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
+	h.LiveCacheTTL = 100 * time.Millisecond
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	key := ArtifactKey("abc", "/a.mkv~hls/s0.m3u8", "pt", "m", PromptVersion)
+
+	doLive(h, "GET", srv.url())
+	first := liveCur(t, h, key)
+	for i := 0; i < 3; i++ {
+		time.Sleep(60 * time.Millisecond)
+		if rec := doLive(h, "GET", srv.url()); rec.Code != 200 {
+			t.Fatalf("poll %d: code=%d", i, rec.Code)
+		}
+		if got := liveCur(t, h, key); got != first {
+			t.Fatalf("poll %d was served a fresh source: the cache TTL did not slide", i)
+		}
+	}
+}
+
+// TestHandlerLiveTransientRefreshIsNotA404: only ErrSourceGone means the
+// track is not there. A 502 from the proxy, a timeout on a cold catch-up or
+// a half-written playlist are answers about this moment, and a client is
+// entitled to treat a 404 as final — so they are served as an empty live
+// snapshot the client keeps polling, while the job retries on its own tick.
+func TestHandlerLiveTransientRefreshIsNotA404(t *testing.T) {
+	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv.mu.Lock()
+	srv.status = 500
+	srv.mu.Unlock()
+	rec := doLive(h, "GET", srv.url())
+	if rec.Code != 200 || rec.Header().Get("X-Subtitle-Live") != "1" || rec.Header().Get("X-Subtitle-Progress") != "0/0" {
+		t.Fatalf("code=%d live=%q progress=%q", rec.Code, rec.Header().Get("X-Subtitle-Live"), rec.Header().Get("X-Subtitle-Progress"))
+	}
+}
+
+// TestHandlerLiveRejectsNonHTTPSourceScheme: the source URL arrives in a
+// header, and only http(s) is a subtitle playlist. The offline path has
+// guarded this since it existed; the live path surfaced the transport's own
+// refusal as 404 instead, which the README's status table does not describe.
+func TestHandlerLiveRejectsNonHTTPSourceScheme(t *testing.T) {
+	h, _ := newLiveHandlerForTest(t, &fakeTranslator{})
+	for _, u := range []string{"file:///etc/passwd.m3u8", "gopher://x/s0.m3u8"} {
+		rec := doLive(h, "GET", u)
+		if rec.Code != 400 || rec.Body.String() != msgBadRequest+"\n" {
+			t.Fatalf("%s: code=%d body=%q", u, rec.Code, rec.Body.String())
+		}
 	}
 }

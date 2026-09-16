@@ -134,7 +134,10 @@ func (d *Doc) Render(translated []string, upTo int) ([]byte, error) {
 // order (Snapshot's movie-time order), and a cue without a translation yet
 // is left out entirely rather than shown in the source language — the
 // viewer asked for a translation, and a source-language line under an AI
-// chip reads as a wrong one. This is the opposite default from Render
+// chip reads as a wrong one. "Yet" is the whole of it: a cue the model
+// refused, or answered with the wrong line count, has its source text
+// written into the translated slice by keepSource and is rendered from
+// there, exactly as on the file path. This is the opposite default from Render
 // (which falls back to the source text below its upTo prefix). Structurally
 // empty cues (nothing left after normalization) are kept as empty cues, as
 // Render does. There is no upTo: a live snapshot always renders every cue
