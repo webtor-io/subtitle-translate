@@ -13,6 +13,15 @@ import (
 type Progress struct {
 	Total int
 	Lines []string
+	// CueKeys is the CueKey of every cue, indexed like Lines. Live jobs only:
+	// a restarted job matches the cues it rediscovers against these and
+	// reuses the translations instead of paying for them twice.
+	CueKeys []string
+	// Live marks a progress record written while the playlist was still
+	// growing. It is cleared on the last write of a live job that produced
+	// no final artifact, which is how a reader tells "still coming" from
+	// "this is all there will be".
+	Live bool
 }
 
 type Store interface {
@@ -75,14 +84,16 @@ func (m *MemoryStore) GetProgress(_ context.Context, key string) (*Progress, err
 	if !ok {
 		return nil, nil
 	}
-	cp := &Progress{Total: p.Total, Lines: append([]string(nil), p.Lines...)}
+	cp := &Progress{Total: p.Total, Lines: append([]string(nil), p.Lines...),
+		CueKeys: append([]string(nil), p.CueKeys...), Live: p.Live}
 	return cp, nil
 }
 
 func (m *MemoryStore) PutProgress(_ context.Context, key string, p *Progress) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.progress[key] = &Progress{Total: p.Total, Lines: append([]string(nil), p.Lines...)}
+	m.progress[key] = &Progress{Total: p.Total, Lines: append([]string(nil), p.Lines...),
+		CueKeys: append([]string(nil), p.CueKeys...), Live: p.Live}
 	return nil
 }
 

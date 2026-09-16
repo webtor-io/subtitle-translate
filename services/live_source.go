@@ -29,6 +29,12 @@ type LiveSource struct {
 	maxBytes int64
 	maxCues  int
 
+	// refreshMu serializes whole Refresh calls: the handler refreshes once
+	// on the first GET while the job's loop refreshes on its own ticker, and
+	// two concurrent passes over the same playlist would fetch every new
+	// segment twice (seen is only marked after the fetch).
+	refreshMu sync.Mutex
+
 	mu         sync.Mutex
 	seen       map[string]bool
 	ended      bool
@@ -89,6 +95,8 @@ func (s *LiveSource) get(ctx context.Context, u string) ([]byte, error) {
 // the playlist, ErrSourceTooLarge past the caps; other fetch errors are
 // returned as-is (transient: the caller retries next tick).
 func (s *LiveSource) Refresh(ctx context.Context) (Refresh, error) {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
 	data, err := s.get(ctx, s.url)
 	if err != nil {
 		return Refresh{}, err

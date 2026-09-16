@@ -292,3 +292,171 @@ func TestRunnerLimitsConcurrentJobs(t *testing.T) {
 	waitForCalls(t, ft, 2)
 	r.Wait("b")
 }
+
+func newLiveRunner(t *testing.T, tr Translator, batch int, cfg LiveConfig) (*Runner, *MemoryStore) {
+	t.Helper()
+	st := NewMemoryStore()
+	r := NewRunner(st, tr, batch, 4, time.Minute)
+	r.SetLive(cfg)
+	t.Cleanup(r.Close)
+	return r, st
+}
+
+func TestLiveRunnerTranslatesByTimerThenFinal(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0, "s0-1.vtt": seg1})
+	tr := &fakeTranslator{}
+	r, st := newLiveRunner(t, tr, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: 30 * time.Millisecond, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	time.Sleep(80 * time.Millisecond) // one cue pending for > BatchWait → translated alone
+	p, _ := st.GetProgress(context.Background(), "k")
+	if p == nil || len(p.Lines) != 1 || p.Lines[0] != "PT:Макс." || !p.Live || p.CueKeys[0] == "" {
+		t.Fatalf("progress after timer batch: %+v", p)
+	}
+	srv.set(pl2end, nil)
+	r.Wait("k")
+	body, ok, _ := st.GetFinal(context.Background(), "k")
+	if !ok || !strings.Contains(string(body), "PT:Привет.") {
+		t.Fatalf("final missing: ok=%v body=%s", ok, body)
+	}
+	if p, _ := st.GetProgress(context.Background(), "k"); p != nil {
+		t.Fatal("progress must be dropped after the final")
+	}
+}
+
+func TestLiveRunnerBatchBySize(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": vttWith(4)})
+	tr := &fakeTranslator{}
+	r, st := newLiveRunner(t, tr, 2, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	time.Sleep(80 * time.Millisecond)
+	p, _ := st.GetProgress(context.Background(), "k")
+	if p == nil || countFilled(p.Lines) != 4 || atomic.LoadInt32(&tr.calls) != 2 {
+		t.Fatalf("size batches: filled=%d calls=%d", countFilled(p.Lines), atomic.LoadInt32(&tr.calls))
+	}
+}
+
+func countFilled(lines []string) int {
+	n := 0
+	for _, l := range lines {
+		if l != "" {
+			n++
+		}
+	}
+	return n
+}
+
+func TestLiveRunnerNoFinalAfterSeek(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	seek := "#EXTM3U\n#EXT-X-SESSION-OFFSET:600\n#EXTINF:2.0,\ns0-0.vtt?token=T\n#EXT-X-ENDLIST\n"
+	srv.set(seek, map[string]string{"s0-0.vtt": seg0})
+	r, st := newLiveRunner(t, &fakeTranslator{}, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	r.Wait("k")
+	if _, ok, _ := st.GetFinal(context.Background(), "k"); ok {
+		t.Fatal("a run that did not start at 0 must not produce a final artifact")
+	}
+	p, _ := st.GetProgress(context.Background(), "k")
+	if p == nil || p.Live || p.Lines[0] != "PT:Макс." {
+		t.Fatalf("partial progress kept without Live: %+v", p)
+	}
+}
+
+func TestLiveRunnerStopsWhenViewerGone(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	r, st := newLiveRunner(t, &fakeTranslator{}, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: 50 * time.Millisecond})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	done := make(chan struct{})
+	go func() { r.Wait("k"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not stop after the idle window")
+	}
+	p, _ := st.GetProgress(context.Background(), "k")
+	if p == nil || !p.Live {
+		t.Fatalf("progress must stay Live (source not ended): %+v", p)
+	}
+	srv.mu.Lock()
+	hits := srv.hits["/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/s0.m3u8"]
+	srv.mu.Unlock()
+	time.Sleep(50 * time.Millisecond)
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.hits["/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/s0.m3u8"] != hits {
+		t.Fatal("playlist still polled after the job stopped")
+	}
+}
+
+func TestLiveRunnerStopsOnSourceGone(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	r, st := newLiveRunner(t, &fakeTranslator{}, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	time.Sleep(30 * time.Millisecond)
+	srv.mu.Lock()
+	srv.status = 404
+	srv.mu.Unlock()
+	r.Wait("k")
+	p, _ := st.GetProgress(context.Background(), "k")
+	if p == nil || p.Live {
+		t.Fatalf("gone source must clear Live and keep progress: %+v", p)
+	}
+}
+
+func TestLiveRunnerReusesTranslationsByCueKey(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	tr := &fakeTranslator{}
+	r, st := newLiveRunner(t, tr, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: 20 * time.Millisecond, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	time.Sleep(80 * time.Millisecond)
+	srv.mu.Lock()
+	srv.status = 404
+	srv.mu.Unlock()
+	r.Wait("k")
+	calls := atomic.LoadInt32(&tr.calls)
+	// A new session: fresh LiveSource, same key, same cue → no new upstream call.
+	srv.mu.Lock()
+	srv.status = 200
+	srv.mu.Unlock()
+	srv.set(pl1+"#EXT-X-ENDLIST\n", nil)
+	ls2 := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls2})
+	r.Wait("k")
+	if atomic.LoadInt32(&tr.calls) != calls {
+		t.Fatalf("translated again: %d → %d", calls, atomic.LoadInt32(&tr.calls))
+	}
+	if _, ok, _ := st.GetFinal(context.Background(), "k"); !ok {
+		t.Fatal("second contiguous run reaching ENDLIST must write the final")
+	}
+}
+
+func TestLiveSnapshotReportsLive(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	r, _ := newLiveRunner(t, &fakeTranslator{}, 50, LiveConfig{PollInterval: time.Hour, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s, err := r.LiveSnapshot(context.Background(), "k", ls)
+	if err != nil || !s.Live || s.Final || s.Total != 1 || s.Done != 0 || strings.Contains(string(s.Body), "Макс") {
+		t.Fatalf("snap=%+v body=%s err=%v", s, s.Body, err)
+	}
+}
