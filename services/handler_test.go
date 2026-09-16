@@ -1273,7 +1273,7 @@ func TestSyncLiveKeepsDisplacedTranslations(t *testing.T) {
 			t.Fatalf("cue %d: got %q want %q (the record was overwritten)", i, got[i], want[i])
 		}
 	}
-	if idx, _ := pendingByTime(again, got); len(idx) != 0 {
+	if idx, _ := pendingByTime(again, got, 0); len(idx) != 0 {
 		t.Fatalf("%d cues would be translated (and paid for) a second time", len(idx))
 	}
 }

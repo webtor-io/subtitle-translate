@@ -274,21 +274,34 @@ func syncLive(p *Progress, doc *Doc) {
 	p.Total = n
 }
 
-// pendingByTime returns the cues still needing a translation, earliest
-// first: the viewer is watching the front of the document, so the cue that
-// plays next is the one worth spending a batch on. Indexes are Cue.Index,
+// pendingByTime returns the cues still needing a translation: the cues of
+// the run currently at the front of the playlist first (earliest first),
+// then every other pending cue, earliest first. Indexes are Cue.Index,
 // texts are the joined source lines.
-func pendingByTime(doc *Doc, lines []string) ([]int, []string) {
-	var idx []int
-	var texts []string
+//
+// current is the offset of the run the playlist is on right now
+// (LiveSource.CurrentOffset). Ordering by document time alone put every
+// pending cue of an abandoned earlier run ahead of the new position after a
+// seek — there can be hundreds of them — so the cue playing right now waited
+// out the whole backlog before it was even queued. A cue's own Run (set by
+// LiveDoc.Snapshot) says which run it belongs to; matching it against
+// current is what lets the run in progress cut the line.
+func pendingByTime(doc *Doc, lines []string, current time.Duration) ([]int, []string) {
+	var curIdx, restIdx []int
+	var curTexts, restTexts []string
 	for _, c := range doc.Cues {
 		if len(c.Lines) == 0 || c.Index < 0 || c.Index >= len(lines) || lines[c.Index] != "" {
 			continue
 		}
-		idx = append(idx, c.Index)
-		texts = append(texts, JoinLines(c))
+		if c.Run == current {
+			curIdx = append(curIdx, c.Index)
+			curTexts = append(curTexts, JoinLines(c))
+		} else {
+			restIdx = append(restIdx, c.Index)
+			restTexts = append(restTexts, JoinLines(c))
+		}
 	}
-	return idx, texts
+	return append(curIdx, restIdx...), append(curTexts, restTexts...)
 }
 
 // runLive translates a playlist that is still being written. It holds the
@@ -362,7 +375,7 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		// the same document, and the handler refreshes the source too.
 		doc := job.Live.Doc().Snapshot()
 		syncLive(p, doc)
-		idx, texts := pendingByTime(doc, p.Lines)
+		idx, texts := pendingByTime(doc, p.Lines, job.Live.CurrentOffset())
 		pending := len(idx)
 		now := time.Now()
 		switch {

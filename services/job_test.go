@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,6 +16,12 @@ type fakeTranslator struct {
 	delay time.Duration
 	fail  error
 	block chan struct{}
+
+	// mu guards reqs: Translate runs on the job goroutine, requests() is
+	// read from the test goroutine after Wait, but a mutex costs nothing
+	// and keeps this safe if that ever changes.
+	mu   sync.Mutex
+	reqs [][]string
 }
 
 func (f *fakeTranslator) Translate(_ context.Context, req BatchRequest) (BatchResult, error) {
@@ -23,6 +30,9 @@ func (f *fakeTranslator) Translate(_ context.Context, req BatchRequest) (BatchRe
 		<-f.block
 	}
 	time.Sleep(f.delay)
+	f.mu.Lock()
+	f.reqs = append(f.reqs, append([]string(nil), req.Lines...))
+	f.mu.Unlock()
 	if f.fail != nil {
 		return BatchResult{}, f.fail
 	}
@@ -31,6 +41,16 @@ func (f *fakeTranslator) Translate(_ context.Context, req BatchRequest) (BatchRe
 		out[i] = "PT:" + l
 	}
 	return BatchResult{Lines: out, InputTokens: 1, OutputTokens: 1}, nil
+}
+
+// requests is every batch of source lines Translate has been called with,
+// in call order — what pendingByTime handed to translateChunk as texts.
+func (f *fakeTranslator) requests() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][]string, len(f.reqs))
+	copy(out, f.reqs)
+	return out
 }
 
 // vttWith builds n cues with increasing timings: "line 1" … "line n".
@@ -349,6 +369,90 @@ func countFilled(lines []string) int {
 		}
 	}
 	return n
+}
+
+// TestPendingByTimeCurrentRunFirst pins pendingByTime's ordering directly:
+// given a document mixing untranslated cues from an abandoned run (offset 0)
+// with cues from the run the playlist is now on (offset 600), the returned
+// order must start with every run-600 cue before any run-0 cue, regardless
+// of movie time. Reverting to plain document-time order (dropping the
+// current-run split) puts the run-0 cues first and reddens this test.
+func TestPendingByTimeCurrentRunFirst(t *testing.T) {
+	cue := func(i, sec int, run time.Duration, text string) Cue {
+		return Cue{Index: i, Start: time.Duration(sec) * time.Second, End: time.Duration(sec+1) * time.Second, Lines: []string{text}, Run: run}
+	}
+	// Already in movie-time order, as LiveDoc.Snapshot produces: the run-0
+	// backlog (early movie time) sorts ahead of the run-600 cues (600s+) by
+	// time alone.
+	doc := &Doc{Cues: []Cue{
+		cue(0, 0, 0, "a"),
+		cue(1, 1, 0, "b"),
+		cue(2, 2, 0, "c"),
+		cue(3, 601, 600*time.Second, "x"),
+		cue(4, 602, 600*time.Second, "y"),
+	}}
+	lines := make([]string, len(doc.Cues))
+	idx, texts := pendingByTime(doc, lines, 600*time.Second)
+	if len(idx) != 5 {
+		t.Fatalf("idx=%v, want all 5 cues pending", idx)
+	}
+	if idx[0] != 3 || idx[1] != 4 {
+		t.Fatalf("the current run (offset 600) must lead: idx=%v", idx)
+	}
+	if idx[2] != 0 || idx[3] != 1 || idx[4] != 2 {
+		t.Fatalf("the backlog must keep its own time order behind the current run: idx=%v", idx)
+	}
+	if texts[0] != "x" || texts[1] != "y" {
+		t.Fatalf("texts must track idx: %v", texts)
+	}
+}
+
+// TestLiveRunnerTranslatesCurrentRunFirstAfterSeek is the runner-level
+// reproduction of the reported bug: after a seek, hundreds of untranslated
+// cues can be left behind by the abandoned run, and ordering pending work by
+// document time alone spent every batch on that backlog before the cue
+// playing now was even queued — at 50 cues/batch and several seconds/batch,
+// minutes of wait at the new position. Here the run-0 backlog is 4 cues,
+// kept under batchSize and behind an hour-long BatchWait so nothing is
+// translated before the seek; the seek playlist ends the session
+// (#EXT-X-ENDLIST), which flushes everything pending in one batch, and it is
+// that batch's own line order — recorded via fakeTranslator.requests — that
+// pins the fix.
+func TestLiveRunnerTranslatesCurrentRunFirstAfterSeek(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": vttWith(4)})
+	tr := &fakeTranslator{}
+	r, st := newLiveRunner(t, tr, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+
+	// The 4-cue backlog sits well under batchSize(50), and BatchWait(1h)
+	// never expires here, so nothing fires on its own.
+	time.Sleep(80 * time.Millisecond)
+	if calls := atomic.LoadInt32(&tr.calls); calls != 0 {
+		t.Fatalf("the run-0 backlog must wait for the seek, got %d upstream calls already", calls)
+	}
+
+	// The transcoder restarted at a seek: new offset, new segment content,
+	// playlist ends immediately.
+	seek := "#EXTM3U\n#EXT-X-SESSION-OFFSET:600\n#EXTINF:2.0,\ns0-0.vtt?token=T\n#EXT-X-ENDLIST\n"
+	srv.set(seek, map[string]string{"s0-0.vtt": "WEBVTT\n\n00:00.000 --> 00:01.000\nseeked line\n"})
+	r.Wait("k")
+
+	reqs := tr.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("want exactly one upstream batch, got %d: %v", len(reqs), reqs)
+	}
+	if len(reqs[0]) != 5 {
+		t.Fatalf("want all 5 pending cues in the one batch, got %d: %v", len(reqs[0]), reqs[0])
+	}
+	if reqs[0][0] != "seeked line" {
+		t.Fatalf("the current run's cue must lead the batch, got %v", reqs[0])
+	}
+	if p, _ := st.GetProgress(context.Background(), "k"); p == nil || p.Live || p.Status != statusDone {
+		t.Fatalf("seeked run reaching ENDLIST must record Status=done: %+v", p)
+	}
 }
 
 func TestLiveRunnerNoFinalAfterSeek(t *testing.T) {

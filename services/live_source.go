@@ -84,6 +84,12 @@ type LiveSource struct {
 	// half-written playlist and a transcoder that accepts and stalls all
 	// last longer than a poll interval.
 	lastAttempt time.Time
+	// currentOffset is the #EXT-X-SESSION-OFFSET of the most recent
+	// successful playlist read: which run pendingByTime should translate
+	// first when a seek has left an earlier run's cues still untranslated.
+	// A failed attempt leaves it as it was — nothing about the current run
+	// changed, only the attempt to confirm it failed.
+	currentOffset time.Duration
 }
 
 func NewLiveSource(playlistURL string, client *http.Client, maxBytes int64, maxCues int) *LiveSource {
@@ -160,6 +166,15 @@ func (s *LiveSource) RunEnded() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.runEnded
+}
+
+// CurrentOffset is the #EXT-X-SESSION-OFFSET the most recent successful
+// playlist read reported. pendingByTime uses it to translate the run the
+// playlist is currently on before the backlog of any run it left behind.
+func (s *LiveSource) CurrentOffset() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.currentOffset
 }
 
 func (s *LiveSource) get(ctx context.Context, u string) ([]byte, error) {
@@ -395,6 +410,7 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 	}
 	out.Ended = s.ended
 	s.lastRefresh = time.Now()
+	s.currentOffset = pl.Offset
 	s.mu.Unlock()
 	return out, nil
 }

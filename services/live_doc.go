@@ -182,7 +182,9 @@ func (d *LiveDoc) Snapshot() *Doc {
 	sort.SliceStable(idx, func(a, b int) bool { return d.cues[idx[a]].Start < d.cues[idx[b]].Start })
 	out := &Doc{Items: &astisub.Subtitles{}}
 	for _, i := range idx {
-		out.Cues = append(out.Cues, d.cues[i])
+		c := d.cues[i]
+		c.Run = d.offsets[i]
+		out.Cues = append(out.Cues, c)
 		out.Items.Items = append(out.Items.Items, d.items[i])
 	}
 	return out
