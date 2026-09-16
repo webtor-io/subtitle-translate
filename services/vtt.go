@@ -126,6 +126,50 @@ func (d *Doc) Render(translated []string, upTo int) ([]byte, error) {
 			Lines:       lines,
 		})
 	}
+	return writeVTTDoc(out)
+}
+
+// RenderByIndex is Render for a live document: translated is indexed by
+// Cue.Index (the append order), cues are written in the document's own
+// order (Snapshot's movie-time order), and a cue without a translation yet
+// is left out entirely rather than shown in the source language — the
+// viewer asked for a translation, and a source-language line under an AI
+// chip reads as a wrong one. This is the opposite default from Render
+// (which falls back to the source text below its upTo prefix). Structurally
+// empty cues (nothing left after normalization) are kept as empty cues, as
+// Render does. There is no upTo: a live snapshot always renders every cue
+// known so far.
+func (d *Doc) RenderByIndex(translated []string) ([]byte, error) {
+	out := &astisub.Subtitles{Metadata: d.Items.Metadata, Styles: d.Items.Styles, Regions: d.Items.Regions}
+	for i, c := range d.Cues {
+		src := d.Items.Items[i]
+		var lines []astisub.Line
+		switch {
+		case c.Index < len(translated) && strings.TrimSpace(translated[c.Index]) != "":
+			for _, t := range SplitLines(translated[c.Index]) {
+				lines = append(lines, astisub.Line{Items: []astisub.LineItem{{Text: t}}})
+			}
+		case len(c.Lines) == 0:
+			// Structurally empty cue: keep its slot, same as Render.
+		default:
+			// Not translated yet: omit rather than leak the source text.
+			continue
+		}
+		out.Items = append(out.Items, &astisub.Item{
+			StartAt:     src.StartAt,
+			EndAt:       src.EndAt,
+			InlineStyle: src.InlineStyle,
+			Region:      src.Region,
+			Style:       src.Style,
+			Lines:       lines,
+		})
+	}
+	return writeVTTDoc(out)
+}
+
+// writeVTTDoc serializes a subtitles document to WebVTT bytes. An empty
+// document still renders a valid (header-only) WebVTT payload.
+func writeVTTDoc(out *astisub.Subtitles) ([]byte, error) {
 	buf := &bytes.Buffer{}
 	if len(out.Items) == 0 {
 		buf.WriteString("WEBVTT\n\n")
