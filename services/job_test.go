@@ -460,3 +460,91 @@ func TestLiveSnapshotReportsLive(t *testing.T) {
 		t.Fatalf("snap=%+v body=%s err=%v", s, s.Body, err)
 	}
 }
+
+// TestLiveRunnerReusesTranslationsAfterTheDocumentShrinks is the case
+// positional reuse gets wrong: a restarted session whose playlist no longer
+// carries the first segment renumbers every cue, so the cue that was index
+// 1 is now index 0. Nothing may be translated twice, and no cue may be
+// rendered with another cue's text.
+func TestLiveRunnerReusesTranslationsAfterTheDocumentShrinks(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl2, map[string]string{"s0-0.vtt": seg0, "s0-1.vtt": seg1})
+	tr := &fakeTranslator{}
+	r, st := newLiveRunner(t, tr, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: 20 * time.Millisecond, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	time.Sleep(80 * time.Millisecond)
+	srv.mu.Lock()
+	srv.status = 404
+	srv.mu.Unlock()
+	r.Wait("k")
+	p, _ := st.GetProgress(context.Background(), "k")
+	if p == nil || countFilled(p.Lines) != 2 {
+		t.Fatalf("the first run must translate both spoken cues: %+v", p)
+	}
+	calls := atomic.LoadInt32(&tr.calls)
+	// The new session serves the tail of the playlist only: "Привет." keeps
+	// its movie time (and so its cue key) but lands at index 0.
+	srv.mu.Lock()
+	srv.status = 200
+	srv.mu.Unlock()
+	only1 := "#EXTM3U\n#EXT-X-SESSION-OFFSET:0\n#EXTINF:1.3,\ns0-1.vtt?token=T\n#EXT-X-ENDLIST\n"
+	srv.set(only1, nil)
+	ls2 := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls2})
+	r.Wait("k")
+	if got := atomic.LoadInt32(&tr.calls); got != calls {
+		t.Fatalf("translated again: %d → %d", calls, got)
+	}
+	body, ok, _ := st.GetFinal(context.Background(), "k")
+	if !ok || !strings.Contains(string(body), "PT:Привет.") {
+		t.Fatalf("final missing the reused translation: ok=%v body=%s", ok, body)
+	}
+	if strings.Contains(string(body), "PT:Макс.") {
+		t.Fatalf("the first run's translation landed under the wrong cue: %s", body)
+	}
+}
+
+// A job that stopped because its source went away is not live any more,
+// even though the playlist it was reading never said ENDLIST. Reading
+// liveness off the source would leave the client polling a track nobody is
+// translating.
+func TestLiveSnapshotNotLiveAfterTheSourceIsGone(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	r, _ := newLiveRunner(t, &fakeTranslator{}, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	time.Sleep(30 * time.Millisecond)
+	srv.mu.Lock()
+	srv.status = 404
+	srv.mu.Unlock()
+	r.Wait("k")
+	if ls.Ended() {
+		t.Fatal("the fixture must leave the playlist unfinished")
+	}
+	s, err := r.LiveSnapshot(context.Background(), "k", ls)
+	if err != nil || s.Live || s.Final {
+		t.Fatalf("a stopped job must not report live: snap=%+v err=%v", s, err)
+	}
+}
+
+// Ensure seeds the idle mark itself, so the idle window does not depend on
+// a Touch surviving the exit of the previous job for the same key.
+func TestLiveRunnerIdlesOutWithoutATouch(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	r, _ := newLiveRunner(t, &fakeTranslator{}, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: 50 * time.Millisecond})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls}) // nobody touched this key
+	done := make(chan struct{})
+	go func() { r.Wait("k"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a job nobody touched must still stop after the idle window")
+	}
+}
