@@ -130,3 +130,26 @@ func TestLiveDocDedupsAClippedCueByItsEnd(t *testing.T) {
 		t.Fatalf("a clipped twin is the same cue: n=%d len=%d", n, d.Len())
 	}
 }
+
+// TestLiveDocKeepsARepeatedLineWithinOneRun: the tolerance exists for the
+// keyframe artefact between two runs of the same file, and two cues of one
+// run can never be that artefact. A line genuinely said twice inside three
+// seconds — "Нет." answered and answered again — is two cues, and collapsing
+// it drops a line the viewer was meant to read and lowers the total.
+func TestLiveDocKeepsARepeatedLineWithinOneRun(t *testing.T) {
+	const first = "WEBVTT\n\n00:10.000 --> 00:11.000\nНет.\n"
+	const again = "WEBVTT\n\n00:11.500 --> 00:12.500\nНет.\n"
+	d := NewLiveDoc()
+	if n, err := d.AddSegment(600*time.Second, []byte(first)); err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if n, _ := d.AddSegment(600*time.Second, []byte(again)); n != 1 || d.Len() != 2 {
+		t.Fatalf("a repeat within one run is a second cue: n=%d len=%d", n, d.Len())
+	}
+	// The cross-run twin of that same second cue (offset 570, 1.657 s of run
+	// shift → 611.657) is still one cue: the tolerance keeps its whole point.
+	const twin = "WEBVTT\n\n00:41.657 --> 00:42.657\nНет.\n"
+	if n, _ := d.AddSegment(570*time.Second, []byte(twin)); n != 0 || d.Len() != 2 {
+		t.Fatalf("a cross-run twin is the same cue: n=%d len=%d", n, d.Len())
+	}
+}

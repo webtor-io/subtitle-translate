@@ -6,25 +6,30 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // livePlaylistServer serves a playlist whose body the test swaps at will,
 // and segments from a map. Requests are counted per path.
 type livePlaylistServer struct {
-	mu       sync.Mutex
-	playlist string
-	status   int
-	segments map[string]string
-	segFail  map[string]int
-	hits     map[string]int
-	srv      *httptest.Server
+	mu        sync.Mutex
+	playlist  string
+	status    int
+	segments  map[string]string
+	segFail   map[string]int
+	segAlways map[string]int
+	hits      map[string]int
+	srv       *httptest.Server
 }
 
 func newLivePlaylistServer(t *testing.T) *livePlaylistServer {
 	t.Helper()
-	s := &livePlaylistServer{status: 200, segments: map[string]string{}, segFail: map[string]int{}, hits: map[string]int{}}
+	s := &livePlaylistServer{status: 200, segments: map[string]string{}, segFail: map[string]int{}, segAlways: map[string]int{}, hits: map[string]int{}}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -36,6 +41,10 @@ func newLivePlaylistServer(t *testing.T) *livePlaylistServer {
 			}
 			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 			_, _ = w.Write([]byte(s.playlist))
+			return
+		}
+		if st, ok := s.segAlways[r.URL.Path]; ok {
+			w.WriteHeader(st)
 			return
 		}
 		if st, ok := s.segFail[r.URL.Path]; ok {
@@ -71,6 +80,26 @@ func (s *livePlaylistServer) failSegmentOnce(name string, status int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.segFail["/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/"+name] = status
+}
+
+// failSegmentAlways makes every request for one segment answer status: the
+// segment the transcoder has GC'd while still listing it, or a path the
+// proxy in front of it keeps rate-limiting.
+func (s *livePlaylistServer) failSegmentAlways(name string, status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.segAlways["/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/"+name] = status
+}
+
+// counterValue reads a counter without prometheus/testutil, which would pull
+// a new module in for one number.
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetCounter().GetValue()
 }
 
 func (s *livePlaylistServer) url() string {
@@ -338,5 +367,177 @@ func TestLiveSourceRefreshIfStaleSkipsAFreshRead(t *testing.T) {
 	srv.mu.Unlock()
 	if third != 2 {
 		t.Fatalf("a stale source must be re-read: playlist hits=%d", third)
+	}
+}
+
+// TestLiveSourceRefreshIfStaleThrottlesAFailingUpstream: staleness keyed on
+// the last *success* means an upstream that is failing is re-read on every
+// single poll, from every viewer, on every replica — one playlist read per
+// poll instead of the documented one per interval, and each of them can burn
+// the full fetch timeout. The attempt is what the throttle is about, not its
+// outcome.
+func TestLiveSourceRefreshIfStaleThrottlesAFailingUpstream(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	srv.mu.Lock()
+	srv.status = 500
+	srv.mu.Unlock()
+	playlist := "/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/s0.m3u8"
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+
+	if _, err := ls.RefreshIfStale(context.Background(), time.Hour); err == nil {
+		t.Fatal("a 500 on the playlist must surface as an error")
+	}
+	// The second poll lands inside maxAge: it serves what is known instead of
+	// asking the sick upstream again.
+	if _, err := ls.RefreshIfStale(context.Background(), time.Hour); err != nil {
+		t.Fatalf("a throttled poll must serve what is known, got %v", err)
+	}
+	srv.mu.Lock()
+	hits := srv.hits[playlist]
+	srv.mu.Unlock()
+	if hits != 1 {
+		t.Fatalf("a failing upstream must be re-read at most once per maxAge: playlist hits=%d, want 1", hits)
+	}
+
+	// Past maxAge it is asked again — the throttle is a rate limit, not a
+	// memory of failure.
+	if _, err := ls.RefreshIfStale(context.Background(), 0); err == nil {
+		t.Fatal("past maxAge the upstream must be asked again")
+	}
+	srv.mu.Lock()
+	hits = srv.hits[playlist]
+	srv.mu.Unlock()
+	if hits != 2 {
+		t.Fatalf("playlist hits=%d, want 2", hits)
+	}
+}
+
+// TestLiveSourceRefreshIfStaleDoesNotQueueBehindAnInFlightRefresh: the
+// handler calls this on every poll of every viewer of the key, on a context
+// detached from the request. Blocking on refreshMu would pile those polls up
+// behind one stalled playlist read (the transcoder accepting and then not
+// answering is the scenario the poll loop's own comment cites), each waiting
+// up to the fetch timeout, and a disconnected client would not free its slot.
+// Liveness is the point of the handler's refresh, not the freshness of this
+// one response.
+func TestLiveSourceRefreshIfStaleDoesNotQueueBehindAnInFlightRefresh(t *testing.T) {
+	release := make(chan struct{})
+	var hits int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		<-release
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-SESSION-OFFSET:0\n#EXT-X-TARGETDURATION:64\n"))
+	}))
+	defer srv.Close()
+	// Releasing before Close runs on every exit path, a failing assertion
+	// included: Close waits out the in-flight request, so a test that dies
+	// while the handler is parked would hang the suite instead of failing it.
+	var once sync.Once
+	releaseAll := func() { once.Do(func() { close(release) }) }
+	defer releaseAll()
+
+	ls := NewLiveSource(srv.URL+"/s0.m3u8", srv.Client(), 1<<20, 5000)
+	stuck := make(chan struct{})
+	go func() {
+		defer close(stuck)
+		_, _ = ls.RefreshIfStale(context.Background(), time.Hour)
+	}()
+	for atomic.LoadInt64(&hits) == 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	second := make(chan struct{})
+	go func() {
+		defer close(second)
+		_, _ = ls.RefreshIfStale(context.Background(), time.Hour)
+	}()
+	select {
+	case <-second:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("a poll queued behind an in-flight refresh instead of serving what is known")
+	}
+	if got := atomic.LoadInt64(&hits); got != 1 {
+		t.Fatalf("the second poll read the playlist anyway: hits=%d", got)
+	}
+
+	releaseAll()
+	<-stuck
+	<-second
+}
+
+// TestLiveSourceSkipsASegmentAfterThreeStrikes: a segment that keeps failing
+// is retried at the head of the playlist forever, so one dead segment freezes
+// the whole document — playlist 200, X-Subtitle-Live: 1, progress stuck, and
+// nothing but a repeating warn to say so. A segment the transcoder has GC'd
+// while still listing it, or one behind a path the proxy keeps rate-limiting,
+// does exactly that. After three strikes it is given up on, the pass carries
+// on to the segments behind it, and the skip leaves a trace.
+func TestLiveSourceSkipsASegmentAfterThreeStrikes(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl2, map[string]string{"s0-0.vtt": seg0, "s0-1.vtt": seg1})
+	srv.failSegmentAlways("s0-0.vtt", 503)
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	before := counterValue(t, LiveSegmentsSkipped)
+
+	for i := 0; i < 2; i++ {
+		if _, err := ls.Refresh(context.Background()); err == nil {
+			t.Fatalf("pass %d: a failing segment must still surface as an error", i)
+		}
+		if got := ls.Doc().Len(); got != 0 {
+			t.Fatalf("pass %d: playlist order must hold while the segment has strikes left, doc len=%d", i, got)
+		}
+	}
+
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatalf("the third strike must skip the segment and finish the pass: %v", err)
+	}
+	if got := ls.Doc().Len(); got != 2 {
+		t.Fatalf("doc len=%d, want 2 (the cues of the segment behind the dead one)", got)
+	}
+	if got := counterValue(t, LiveSegmentsSkipped) - before; got != 1 {
+		t.Fatalf("skipped counter moved by %v, want 1", got)
+	}
+	if ls.Contiguous() {
+		t.Fatal("a skipped segment is a hole: the run must not be able to write a final artifact")
+	}
+
+	// And it is not paid for again on every later pass.
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatalf("a skipped segment must not come back: %v", err)
+	}
+	if got := counterValue(t, LiveSegmentsSkipped) - before; got != 1 {
+		t.Fatalf("skipped counter moved by %v after a fourth pass, want 1", got)
+	}
+}
+
+// TestLiveSourceRetriesASegmentBeforeGivingUp is the other side: the strikes
+// are consecutive, so the hiccup the transient path exists for (a 503 under
+// load) still costs nothing. Two failures then a success must leave the
+// document whole and nothing skipped.
+func TestLiveSourceRetriesASegmentBeforeGivingUp(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl2, map[string]string{"s0-0.vtt": seg0, "s0-1.vtt": seg1})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	before := counterValue(t, LiveSegmentsSkipped)
+
+	for i := 0; i < 2; i++ {
+		srv.failSegmentOnce("s0-0.vtt", 503)
+		if _, err := ls.Refresh(context.Background()); err == nil {
+			t.Fatalf("pass %d: the failing segment must surface as an error", i)
+		}
+	}
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatalf("the third pass succeeds: %v", err)
+	}
+	if got := ls.Doc().Len(); got != 3 {
+		t.Fatalf("doc len=%d, want 3 (both segments merged)", got)
+	}
+	if got := counterValue(t, LiveSegmentsSkipped) - before; got != 0 {
+		t.Fatalf("nothing was given up on, counter moved by %v", got)
+	}
+	if !ls.Contiguous() {
+		t.Fatal("no segment was skipped, so the run stays contiguous")
 	}
 }

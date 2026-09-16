@@ -9,12 +9,22 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
 	ErrSourceGone     = errors.New("source gone")
 	ErrSourceTooLarge = errors.New("source too large")
 )
+
+// segmentMaxStrikes is how many consecutive failures one segment gets before
+// the source gives up on it. A segment is retried at the head of the playlist
+// (order matters: the segments behind it wait), so without a terminal state
+// one segment the transcoder has GC'd while still listing it — or one behind
+// a path the proxy keeps rate-limiting — freezes the whole document while the
+// playlist keeps answering 200. Three covers the hiccup the transient path
+// exists for and still gives up within a few poll intervals.
+const segmentMaxStrikes = 3
 
 type Refresh struct {
 	Added int
@@ -35,8 +45,12 @@ type LiveSource struct {
 	// segment twice (seen is only marked after the fetch).
 	refreshMu sync.Mutex
 
-	mu         sync.Mutex
-	seen       map[string]bool
+	mu   sync.Mutex
+	seen map[string]bool
+	// fails counts consecutive failures per segment key; a success clears
+	// the entry, so only a segment failing every time reaches the strike
+	// limit.
+	fails      map[string]int
 	ended      bool
 	contiguous bool
 	retired    bool
@@ -50,10 +64,17 @@ type LiveSource struct {
 	// the source it serves growing without doubling the poll rate of the
 	// one that does.
 	lastRefresh time.Time
+	// lastAttempt is when a refresh last finished, successfully or not.
+	// RefreshIfStale gates on it rather than on lastRefresh alone, so an
+	// upstream that keeps failing costs one playlist read per maxAge per
+	// replica instead of one per poll of every viewer — a 5xx, a
+	// half-written playlist and a transcoder that accepts and stalls all
+	// last longer than a poll interval.
+	lastAttempt time.Time
 }
 
 func NewLiveSource(playlistURL string, client *http.Client, maxBytes int64, maxCues int) *LiveSource {
-	return &LiveSource{url: playlistURL, client: client, doc: NewLiveDoc(), maxBytes: maxBytes, maxCues: maxCues, seen: map[string]bool{}, contiguous: true}
+	return &LiveSource{url: playlistURL, client: client, doc: NewLiveDoc(), maxBytes: maxBytes, maxCues: maxCues, seen: map[string]bool{}, fails: map[string]int{}, contiguous: true}
 }
 
 func (s *LiveSource) Doc() *LiveDoc { return s.doc }
@@ -154,24 +175,71 @@ func (s *LiveSource) Refresh(ctx context.Context) (Refresh, error) {
 	return s.refresh(ctx)
 }
 
-// RefreshIfStale runs Refresh only when the last successful one is older
-// than maxAge (or there has not been one). It exists for the handler: the
-// job refreshes on its own ticker, but only on the replica that won the
-// store lock, and every other replica serves a document that nothing else
-// would ever advance. Calling this on every poll costs at most one playlist
-// read per maxAge per key per replica, and is a no-op on the replica whose
-// loop has just refreshed the same object.
+// RefreshIfStale runs Refresh only when the last attempt — successful or
+// not — is older than maxAge (or there has not been one). It exists for the
+// handler: the job refreshes on its own ticker, but only on the replica that
+// won the store lock, and every other replica serves a document that nothing
+// else would ever advance. Calling this on every poll costs at most one
+// playlist read per maxAge per key per replica, and is a no-op on the replica
+// whose loop has just refreshed the same object.
+//
+// It never waits for a refresh already in flight. The handler runs this on a
+// context detached from the request, so blocking here would queue every
+// poller of the key behind one stalled playlist read — request k waiting k
+// fetch timeouts, and a client that hung up not freeing its place. What the
+// handler's refresh buys is liveness of the document, not freshness of this
+// one response, so a poll that finds the lock taken serves what is known and
+// lets the in-flight refresh deliver it to the next one.
 func (s *LiveSource) RefreshIfStale(ctx context.Context, maxAge time.Duration) (Refresh, error) {
-	s.refreshMu.Lock()
+	if !s.refreshMu.TryLock() {
+		return Refresh{Ended: s.Ended()}, nil
+	}
 	defer s.refreshMu.Unlock()
 	s.mu.Lock()
 	last := s.lastRefresh
+	if s.lastAttempt.After(last) {
+		last = s.lastAttempt
+	}
 	ended := s.ended
 	s.mu.Unlock()
 	if !last.IsZero() && time.Since(last) < maxAge {
 		return Refresh{Ended: ended}, nil
 	}
 	return s.refresh(ctx)
+}
+
+// strike records one more consecutive failure for a segment and returns the
+// running count.
+func (s *LiveSource) strike(key string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fails[key]++
+	return s.fails[key]
+}
+
+// skipSegment gives up on a segment: it is marked seen so this pass and every
+// later one move on to the segments behind it.
+//
+// The document is left with a hole no later reader could detect, so the run
+// stops being contiguous — a final artifact is served forever and without a
+// source, and only a run that saw the whole movie may write one. That is the
+// same rule a run joining after a seek falls under.
+//
+// Only the segment's name is logged: its URI carries the session token, and a
+// status is all the operator needs to tell a GC'd segment from a rate limit.
+func (s *LiveSource) skipSegment(key, name string, cause error) {
+	s.mu.Lock()
+	s.seen[key] = true
+	delete(s.fails, key)
+	s.contiguous = false
+	s.mu.Unlock()
+	LiveSegmentsSkipped.Inc()
+	fields := log.Fields{"segment": name, "strikes": segmentMaxStrikes}
+	var se *sourceStatusError
+	if errors.As(cause, &se) {
+		fields["status"] = se.status
+	}
+	log.WithFields(fields).Warn("giving up on a live segment after repeated failures")
 }
 
 // refresh is Refresh with the refresh lock already held.
@@ -182,6 +250,15 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 	if retired {
 		return Refresh{}, ErrSourceGone
 	}
+	// Stamped on the way out whatever happened, and after the work rather
+	// than before it: a read that took the whole fetch timeout is not stale
+	// the instant it returns. This is what throttles RefreshIfStale against
+	// an upstream that is failing.
+	defer func() {
+		s.mu.Lock()
+		s.lastAttempt = time.Now()
+		s.mu.Unlock()
+	}()
 	data, err := s.get(ctx, s.url)
 	if err != nil {
 		if status, ends := endsSession(err); ends {
@@ -207,20 +284,36 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 		}
 		body, err := s.get(ctx, seg.URI)
 		if err != nil {
-			return out, err
+			if s.strike(key) < segmentMaxStrikes {
+				return out, err
+			}
+			s.skipSegment(key, seg.Name, err)
+			continue
 		}
 		if s.doc.Bytes()+int64(len(body)) > s.maxBytes {
 			return out, ErrSourceTooLarge
 		}
 		n, err := s.doc.AddSegment(pl.Offset, body)
 		if err != nil {
-			return out, err
+			// Same terminal state, for the same reason: a segment that
+			// cannot be parsed will not parse on the next tick either, and
+			// it sits in front of everything after it.
+			if s.strike(key) < segmentMaxStrikes {
+				return out, err
+			}
+			s.skipSegment(key, seg.Name, err)
+			continue
 		}
 		if s.doc.Len() > s.maxCues {
 			return out, ErrSourceTooLarge
 		}
 		s.mu.Lock()
 		s.seen[key] = true
+		// A success clears the segment's strikes. Not observable through
+		// Refresh — a segment that succeeded is also marked seen, so it is
+		// never fetched again — but it keeps fails from accumulating an
+		// entry per segment of the film.
+		delete(s.fails, key)
 		s.mu.Unlock()
 		out.Added += n
 	}

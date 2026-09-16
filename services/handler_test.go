@@ -708,3 +708,61 @@ func TestHandlerLiveRejectsNonHTTPSourceScheme(t *testing.T) {
 		}
 	}
 }
+
+// TestHandlerLiveFollowsASwapInsteadOfA404 is the race N2 names: a poll takes
+// the source the key is on, another poll installs a new transcoder session and
+// retires it underneath, and the first poll's refresh then finds a retired
+// source. That is this process's own bookkeeping, not the transcoder's verdict
+// on the track — answering it with 404, which a client is entitled to treat as
+// final, would kill a viewer whose session is perfectly alive, and every swap
+// (a single viewer seeking is enough) can catch a concurrent poll this way.
+//
+// Driven through liveFor + liveRefresh rather than two concurrent GETs: the
+// handler takes the source and refreshes it in one breath, so the interleaving
+// is not reachable from outside on demand, and a test that raced for it would
+// pass by luck.
+func TestHandlerLiveFollowsASwapInsteadOfA404(t *testing.T) {
+	h, srv1 := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv1.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	srv2 := newLivePlaylistServer(t)
+	const segB = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nВторая сессия.\n"
+	srv2.set(pl1, map[string]string{"s0-0.vtt": segB})
+	key := ArtifactKey("abc", "/a.mkv~hls/s0.m3u8", "pt", "m", PromptVersion)
+
+	a := h.liveFor(key, srv1.url())
+	b := h.liveFor(key, srv2.url())
+	if b == a {
+		t.Fatal("the second session must install its own source")
+	}
+
+	got, err := h.liveRefresh(context.Background(), key, srv1.url(), a, time.Hour)
+	if err != nil {
+		t.Fatalf("a poll overtaken by a swap must not be told the track is gone: %v", err)
+	}
+	if got != b {
+		t.Fatalf("the refresh must follow the source the key moved to, got %s", got.url)
+	}
+	snap := got.Doc().Snapshot()
+	if len(snap.Cues) != 1 || !strings.Contains(strings.Join(snap.Cues[0].Lines, " "), "Вторая сессия") {
+		t.Fatalf("the source followed onto was not refreshed: %+v", snap.Cues)
+	}
+}
+
+// TestHandlerLiveGoneCurrentSourceStillIs404 is the other half: only a source
+// that IS the key's current one and is gone is news about the track. Without
+// this, following a swap would turn every real 404 into an endless 200.
+func TestHandlerLiveGoneCurrentSourceStillIs404(t *testing.T) {
+	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
+	key := ArtifactKey("abc", "/a.mkv~hls/s0.m3u8", "pt", "m", PromptVersion)
+	srv.mu.Lock()
+	srv.status = 404
+	srv.mu.Unlock()
+	src := h.liveFor(key, srv.url())
+	got, err := h.liveRefresh(context.Background(), key, srv.url(), src, time.Hour)
+	if !errors.Is(err, ErrSourceGone) {
+		t.Fatalf("want gone, got %v", err)
+	}
+	if got != src {
+		t.Fatal("a gone current source must not be swapped away from by the refresh itself")
+	}
+}

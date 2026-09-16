@@ -78,10 +78,22 @@ a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
   reading the playlist keeps the transcoder session alive, so an unwatched
   translation would otherwise transcode the whole file for nobody. It also stops
   when the session is gone (404/503 from the transcoder), keeping progress.
+- A segment that fails three times in a row is given up on — marked seen,
+  counted by `subtitle_translate_live_segments_skipped_total`, and left as a
+  hole that stops the run from writing a final artifact — because one segment
+  the transcoder has GC'd while still listing it (or one behind a path the
+  proxy keeps rate-limiting) is retried at the head of the playlist and would
+  otherwise freeze the whole document while the playlist keeps answering 200.
+- A poll refreshes the source it is served from only if the last attempt is
+  older than `--live-poll-interval` — successful or not, so an upstream that
+  is failing costs one playlist read per interval per replica rather than one
+  per poll — and never waits for a refresh already in flight, serving what is
+  known instead of queueing behind a stalled read.
 - Size caps apply to the accumulated document: `--max-source-bytes` to the sum
   of segment bytes, `--max-cues` to the cue count.
-- Cue identity is the cue's text plus a 3-second time window, not an exact
-  timestamp: the transcoder reports the requested (30 s-quantized) seek as
+- Cue identity is the cue's text plus a 3-second time window **across runs**,
+  not an exact timestamp (within one run it stays exact, so a line genuinely
+  said twice inside the window is two cues): the transcoder reports the requested (30 s-quantized) seek as
   `#EXT-X-SESSION-OFFSET` but starts each run at the keyframe at or before it,
   so every run's timeline is offset by up to one GOP (measured: 1.657 s between
   two runs of the same file). A translated cue therefore carries the timing of
@@ -184,6 +196,7 @@ Served when `--use-prom` is set.
 | `subtitle_translate_job_errors_total{code}` | counter | Job errors by cause (`panic`, `store`, `upstream`, `render`, `truncated`, `refusal`, `lock_lost`, `too_large`, `source_gone`, `viewer_gone`). `source_gone` and `viewer_gone` are live-job terminations, not failures: the transcoder session ended or nobody polled the key for `--live-idle` — expected outcomes of a live translation, not something to page on. |
 | `subtitle_translate_jobs_running` | gauge | Translation jobs holding a concurrency slot (`--max-jobs` bounds the offline ones, `--live-max-jobs` the live ones). |
 | `subtitle_translate_job_seconds` | histogram | End-to-end duration of a finished translation job. |
+| `subtitle_translate_live_segments_skipped_total` | counter | Live segments given up on after three consecutive failures. Each one is a hole in the document (and blocks the final artifact for that run), so a steady rate on one film means the transcoder or the proxy in front of it is losing segments. |
 | `subtitle_translate_line_mismatch_total` | counter | Upstream replies whose line count didn't match the batch (retried once, then the original text is kept). |
 
 ## Cost

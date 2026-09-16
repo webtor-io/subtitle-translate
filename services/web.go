@@ -270,6 +270,34 @@ func (h *Handler) liveFor(key, sourceURL string) *LiveSource {
 	return e.cur
 }
 
+// liveRefresh refreshes the source this request is serving and returns the
+// source the rest of the request must use — which is not always the one it
+// came in with.
+//
+// ErrSourceGone on a source that is no longer this key's current one is not
+// news about the track: either another poll retired it between liveFor
+// returning and this refresh (every session swap can catch a concurrent poll,
+// and one viewer seeking is enough to cause one), or this is a straggler
+// being served a current source that has just 404'd. Both are answered by
+// asking liveFor again — it either hands back the session the key moved to,
+// or, if that one is the source that just went gone, installs this request's
+// own URL — and refreshing what it hands back. Exactly once: a client is
+// entitled to treat a 404 as final, so only a gone source that IS the current
+// one may become one.
+func (h *Handler) liveRefresh(ctx context.Context, key, sourceURL string, src *LiveSource, maxAge time.Duration) (*LiveSource, error) {
+	_, err := src.RefreshIfStale(ctx, maxAge)
+	if err == nil || !errors.Is(err, ErrSourceGone) {
+		return src, err
+	}
+	next := h.liveFor(key, sourceURL)
+	if next == src {
+		// The gone source is the one this key is on: a real answer.
+		return src, err
+	}
+	_, nerr := next.RefreshIfStale(ctx, maxAge)
+	return next, nerr
+}
+
 // Client-facing bodies. The real cause is logged and never written to the
 // response: the source URL and the dial error belong to the operator, not
 // to whoever is polling the track.
@@ -362,7 +390,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// so — like docFor's fetch — this read must not die with this
 		// request's own connection.
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sourceFetchTimeout)
-		_, rerr := src.RefreshIfStale(rctx, h.Runner.LivePollInterval())
+		src, rerr := h.liveRefresh(rctx, key, sourceURL, src, h.Runner.LivePollInterval())
 		cancel()
 		if rerr != nil {
 			switch {

@@ -35,15 +35,21 @@ const cueMatchTolerance = 3 * time.Second
 // one FFmpeg run carry times from the run's start; offset is that run's
 // #EXT-X-SESSION-OFFSET, so every cue is stored in movie time. The same
 // cue reached twice (a re-read playlist, or a seek that replays a range)
-// is stored once: identity is normalized text plus movie time within
-// cueMatchTolerance. The cue that is kept is the first one seen, with the
+// is stored once: within one run identity is exact, and across two runs it
+// is normalized text plus movie time within cueMatchTolerance — the window
+// measures the shift between runs, so it is only asked about two of them.
+// The cue that is kept is the first one seen, with the
 // timing of the run that produced it — so its CueKey, the identity every
 // stored translation is filed under, never moves under a reader.
 type LiveDoc struct {
 	mu    sync.Mutex
 	cues  []Cue
 	items []*astisub.Item
-	keys  map[string]int
+	// offsets is the #EXT-X-SESSION-OFFSET of the run each cue came from,
+	// indexed like cues. The tolerance answers a question about two runs, so
+	// the run a cue belongs to is part of its identity.
+	offsets []time.Duration
+	keys    map[string]int
 	// byText indexes cue positions by their joined normalized text, which
 	// is what the tolerant match needs to look up before comparing times.
 	byText map[string][]int
@@ -102,7 +108,7 @@ func (d *LiveDoc) AddSegment(offset time.Duration, vtt []byte) (int, error) {
 		// tolerance: they all share the empty text, they carry no
 		// translation to reuse, and collapsing two that happen to fall
 		// within the window would drop a slot for nothing.
-		if len(c.Lines) > 0 && d.dupWithin(text, c.Start, c.End) {
+		if len(c.Lines) > 0 && d.dupWithin(text, offset, c.Start, c.End) {
 			continue
 		}
 		it := doc.Items.Items[i]
@@ -114,15 +120,25 @@ func (d *LiveDoc) AddSegment(offset time.Duration, vtt []byte) (int, error) {
 		}
 		d.cues = append(d.cues, c)
 		d.items = append(d.items, item)
+		d.offsets = append(d.offsets, offset)
 		added++
 	}
 	return added, nil
 }
 
-// dupWithin reports whether a cue with this text already sits within the
-// tolerance window. Caller holds d.mu.
-func (d *LiveDoc) dupWithin(text string, start, end time.Duration) bool {
+// dupWithin reports whether a cue with this text, from a different run,
+// already sits within the tolerance window. Caller holds d.mu.
+//
+// Only across runs: the window measures the keyframe shift between two runs
+// of the same file, and two cues of one run cannot be that — inside a run the
+// transcoder's timestamps are the film's own, so a line repeated 1.5 s later
+// is a line repeated 1.5 s later. Within a run identity stays exact, which
+// d.keys already decides before this is reached.
+func (d *LiveDoc) dupWithin(text string, offset, start, end time.Duration) bool {
 	for _, i := range d.byText[text] {
+		if d.offsets[i] == offset {
+			continue
+		}
 		if sameCue(d.cues[i].Start, d.cues[i].End, start, end) {
 			return true
 		}

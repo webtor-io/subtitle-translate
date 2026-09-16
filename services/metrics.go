@@ -13,8 +13,12 @@ var (
 	// BatchesFallback counts batches (or split halves) whose cues kept their
 	// source text instead of a translation.
 	BatchesFallback = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "subtitle_translate_batches_fallback_total", Help: "batches left untranslated by reason"}, []string{"reason"})
+	// LiveSegmentsSkipped counts live segments given up on after repeated
+	// failures. Skipping keeps the document moving, but it leaves a hole in
+	// it, so this is the only externally visible trace of one.
+	LiveSegmentsSkipped = prometheus.NewCounter(prometheus.CounterOpts{Name: "subtitle_translate_live_segments_skipped_total", Help: "live segments given up on after repeated failures"})
 )
 
 func init() {
-	prometheus.MustRegister(BatchesTotal, TokensInput, TokensOutput, JobErrors, JobDuration, LineMismatch, BatchesFallback, JobsRunning)
+	prometheus.MustRegister(BatchesTotal, TokensInput, TokensOutput, JobErrors, JobDuration, LineMismatch, BatchesFallback, JobsRunning, LiveSegmentsSkipped)
 }
