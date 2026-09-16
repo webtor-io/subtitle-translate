@@ -19,7 +19,7 @@ Request headers (set by the proxy chain):
 |---|---|
 | `X-Source-Url` | URL of the original (untranslated) VTT track. Required. |
 | `X-Info-Hash` | Torrent info hash, part of the cache key. |
-| `X-Path` | Path of the subtitle file within the torrent, part of the cache key. |
+| `X-Path` | Path of the subtitle file within the torrent, part of the cache key after `/session/<id>/` is removed. |
 
 Optional query parameters:
 
@@ -51,6 +51,31 @@ Error bodies are fixed strings (`bad request`, `source unavailable`, `source too
 A `GET` starts (or resumes) the background job for the key if one isn't already running, and returns the current snapshot immediately (cached final artifact, or the cues translated so far). Callers poll the same URL until `X-Subtitle-Progress` reports done. The parsed source is cached in-process for 10 minutes per key, so polling costs one source fetch, not one per poll.
 
 At most `--max-jobs` translations run at once per replica; further keys are registered immediately and start as slots free up.
+
+## Live HLS source
+
+When `X-Source-Url` points at a media playlist (`….m3u8`) — the transcoder's
+subtitle variant `<file>~hls/session/<id>/s<N>.m3u8` — the job follows the
+playlist instead of reading one file: every `--live-poll-interval` it re-reads
+the playlist, fetches the segments it has not seen, shifts their cues by
+`#EXT-X-SESSION-OFFSET` into movie time and translates what has accumulated —
+a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
+`--live-batch-wait`.
+
+- `X-Subtitle-Live: 1` is set while the playlist is live (no `#EXT-X-ENDLIST`)
+  or the job is still writing. Do not read `done == total` as complete while it
+  is present. The body carries the translated cues only: a cue not translated
+  yet is omitted, never shown in the source language.
+- The final artifact is written only for a contiguous run — offset 0 from the
+  first read to `#EXT-X-ENDLIST`. A viewer who seeks gets a partial translation
+  for the session (kept in Redis for 24 h under the same key, reused by cue
+  identity on the next session); the next contiguous viewing completes it.
+- The job stops on its own when nobody polled the key for `--live-idle`:
+  reading the playlist keeps the transcoder session alive, so an unwatched
+  translation would otherwise transcode the whole file for nobody. It also stops
+  when the session is gone (404/503 from the transcoder), keeping progress.
+- Size caps apply to the accumulated document: `--max-source-bytes` to the sum
+  of segment bytes, `--max-cues` to the cue count.
 
 ## What survives the round trip
 
@@ -121,6 +146,9 @@ GLOBAL OPTIONS:
    --max-source-bytes value            largest source track accepted, in bytes (default: 1048576) [$SUBTITLE_TRANSLATE_MAX_SOURCE_BYTES]
    --lock-ttl value                    how long one replica owns a translation key, seconds; also the per-batch deadline (default: 300) [$SUBTITLE_TRANSLATE_LOCK_TTL]
    --max-jobs value                    translation jobs running at once in this replica (default: 4) [$SUBTITLE_TRANSLATE_MAX_JOBS]
+   --live-poll-interval value          how often a live HLS subtitle playlist is re-read, seconds (default: 4) [$SUBTITLE_TRANSLATE_LIVE_POLL_INTERVAL]
+   --live-batch-wait value             longest a pending live cue waits before a batch smaller than --batch-size is sent, seconds (default: 10) [$SUBTITLE_TRANSLATE_LIVE_BATCH_WAIT]
+   --live-idle value                   a live job stops when nobody polled its key for this long, seconds (default: 90) [$SUBTITLE_TRANSLATE_LIVE_IDLE]
    --help, -h                          show help
    --version, -v                       print the version
 ```
@@ -135,7 +163,7 @@ Served when `--use-prom` is set.
 | `subtitle_translate_tokens_input_total` | counter | Upstream input tokens consumed. |
 | `subtitle_translate_tokens_output_total` | counter | Upstream output tokens consumed. |
 | `subtitle_translate_batches_fallback_total{reason}` | counter | Batches (or split halves) whose cues kept their source text, by `reason`: `mismatch`, `truncated`, `refusal`. |
-| `subtitle_translate_job_errors_total{code}` | counter | Job errors by cause (`panic`, `store`, `upstream`, `render`, `truncated`, `refusal`, `lock_lost`). |
+| `subtitle_translate_job_errors_total{code}` | counter | Job errors by cause (`panic`, `store`, `upstream`, `render`, `truncated`, `refusal`, `lock_lost`, `too_large`, `source_gone`, `viewer_gone`). `source_gone` and `viewer_gone` are live-job terminations, not failures: the transcoder session ended or nobody polled the key for `--live-idle` — expected outcomes of a live translation, not something to page on. |
 | `subtitle_translate_jobs_running` | gauge | Translation jobs holding a concurrency slot (`--max-jobs` bounds it). |
 | `subtitle_translate_job_seconds` | histogram | End-to-end duration of a finished translation job. |
 | `subtitle_translate_line_mismatch_total` | counter | Upstream replies whose line count didn't match the batch (retried once, then the original text is kept). |

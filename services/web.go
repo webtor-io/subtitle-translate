@@ -124,8 +124,14 @@ func ParseNames(q string) []string {
 // sourceCacheTTL is how long a parsed source track is reused. A client
 // polls the same URL every few seconds while the job runs, and the source
 // does not change between polls.
+//
+// liveSourceCacheTTL is longer: a live job can run for the length of a
+// whole movie, and dropping the cached LiveSource mid-playback would
+// restart its accumulated document (and re-fetch every segment) on the
+// next poll instead of reusing what the background job already built.
 const (
 	sourceCacheTTL      = 10 * time.Minute
+	liveSourceCacheTTL  = 30 * time.Minute
 	sourceCacheCapacity = 64
 	sourceFetchTimeout  = 30 * time.Second
 )
@@ -139,6 +145,9 @@ type Handler struct {
 
 	once sync.Once
 	docs *lazymap.LazyMap[*Doc]
+
+	liveOnce sync.Once
+	lives    *lazymap.LazyMap[*LiveSource]
 }
 
 // docCache holds the parsed source per artifact key. Failures are not
@@ -175,6 +184,44 @@ func (h *Handler) docFor(ctx context.Context, key, sourceURL string) (*Doc, *cli
 		return nil, &clientError{http.StatusBadGateway, msgUpstreamUnavail, err}
 	}
 	return doc, nil
+}
+
+// isPlaylistSource reports whether u is the transcoder's subtitle media
+// playlist (…~hls/session/<id>/s<N>.m3u8) rather than a single VTT/SRT
+// track: a live job follows the playlist instead of reading one file.
+func isPlaylistSource(u *url.URL) bool {
+	return strings.HasSuffix(strings.ToLower(u.Path), ".m3u8")
+}
+
+// livesCache is docCache's counterpart for live sources.
+func (h *Handler) livesCache() *lazymap.LazyMap[*LiveSource] {
+	h.liveOnce.Do(func() {
+		h.lives = lazymap.New[*LiveSource](&lazymap.Config{Expire: liveSourceCacheTTL, Capacity: sourceCacheCapacity})
+	})
+	return h.lives
+}
+
+// liveFor returns the cached LiveSource for key, creating one lazily.
+// NewLiveSource makes no network call, so a HEAD before any GET populates
+// the cache without fetching anything.
+//
+// key survives across transcoder sessions (KeyPath strips the session id),
+// but each new session serves its playlist at a new URL. Reusing a cached
+// LiveSource built for the old URL would poll a URL that now 404s, ending
+// the job with source_gone while the viewer is mid-session — so a URL
+// mismatch drops the stale entry and starts a fresh source under the same
+// key instead of trusting the cache.
+func (h *Handler) liveFor(key, sourceURL string) *LiveSource {
+	cache := h.livesCache()
+	newSource := func() (*LiveSource, error) {
+		return NewLiveSource(sourceURL, h.Client, h.MaxSourceBytes, h.MaxCues), nil
+	}
+	src, _ := cache.Get(key, newSource)
+	if src.url != sourceURL {
+		cache.Drop(key)
+		src, _ = cache.Get(key, newSource)
+	}
+	return src
 }
 
 // Client-facing bodies. The real cause is logged and never written to the
@@ -217,8 +264,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, msgBadRequest, http.StatusBadRequest)
 		return
 	}
-	key := ArtifactKey(r.Header.Get("X-Info-Hash"), r.Header.Get("X-Path"), lang, h.Model, PromptVersion)
-	logger := log.WithFields(log.Fields{"key": key[:12], "lang": lang, "infoHash": r.Header.Get("X-Info-Hash"), "path": r.Header.Get("X-Path")})
+	// KeyPath drops the transcoder session id, so every session of the same
+	// stream shares one artifact key; it is the identity function on any
+	// path without a session segment, so a non-HLS track's key is exactly
+	// what it was before.
+	path := KeyPath(r.Header.Get("X-Path"))
+	key := ArtifactKey(r.Header.Get("X-Info-Hash"), path, lang, h.Model, PromptVersion)
+	logger := log.WithFields(log.Fields{"key": key[:12], "lang": lang, "infoHash": r.Header.Get("X-Info-Hash"), "path": path})
 	ctx := r.Context()
 
 	body, found, err := h.Runner.store.GetFinal(ctx, key)
@@ -231,9 +283,62 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if found {
-		writeVTT(w, r, body, 100, 100, true)
+		writeVTT(w, r, body, 100, 100, true, false)
 		return
 	}
+	// Touch keeps a live job's idle timer from expiring: polling the
+	// playlist (GET or HEAD) is what keeps the transcoder session alive.
+	// For a regular source there is no idle job to keep, so this is a
+	// harmless no-op.
+	h.Runner.Touch(key)
+
+	if u, perr := url.Parse(sourceURL); perr == nil && isPlaylistSource(u) {
+		src := h.liveFor(key, sourceURL)
+		if r.Method == http.MethodHead {
+			// HEAD never starts the job (same contract as the regular
+			// source below): it reports what is known without triggering
+			// or waiting on a translation.
+			snap, err := h.Runner.LiveSnapshot(ctx, key, src)
+			if err != nil {
+				logger.WithError(err).Error("live snapshot failed")
+				http.Error(w, msgUpstreamUnavail, http.StatusBadGateway)
+				return
+			}
+			writeVTTLive(w, r, nil, snap)
+			return
+		}
+		// A fresh source has nothing yet: one synchronous read here means
+		// the first response already carries whatever cues exist, and a
+		// gone/oversize source is reported to this request the same way a
+		// regular source's fetch failure is, instead of surfacing only on
+		// the background job's next tick.
+		if src.Doc().Len() == 0 {
+			if _, rerr := src.Refresh(ctx); rerr != nil {
+				switch {
+				case errors.Is(rerr, ErrSourceGone):
+					logger.WithError(rerr).Warn("live source unavailable")
+					http.Error(w, msgSourceUnavail, http.StatusNotFound)
+				case errors.Is(rerr, ErrSourceTooLarge):
+					logger.WithError(rerr).Warn("live source outgrew its caps")
+					http.Error(w, msgSourceTooLarge, http.StatusRequestEntityTooLarge)
+				default:
+					logger.WithError(rerr).Warn("live source unavailable")
+					http.Error(w, msgSourceUnavail, http.StatusNotFound)
+				}
+				return
+			}
+		}
+		h.Runner.Ensure(ctx, key, &Job{Lang: lang, SourceLang: r.URL.Query().Get("srclang"), Glossary: ParseNames(r.URL.Query().Get("names")), Live: src})
+		snap, err := h.Runner.LiveSnapshot(ctx, key, src)
+		if err != nil {
+			logger.WithError(err).Error("live snapshot failed")
+			http.Error(w, msgUpstreamUnavail, http.StatusBadGateway)
+			return
+		}
+		writeVTTLive(w, r, snap.Body, snap)
+		return
+	}
+
 	if r.Method == http.MethodHead {
 		p, _ := h.Runner.store.GetProgress(ctx, key)
 		done, total := 0, 0
@@ -250,7 +355,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		writeVTT(w, r, nil, done, total, false)
+		writeVTT(w, r, nil, done, total, false, false)
 		return
 	}
 	doc, cerr := h.docFor(ctx, key, sourceURL)
@@ -266,7 +371,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, msgUpstreamUnavail, http.StatusBadGateway)
 		return
 	}
-	writeVTT(w, r, snap.Body, snap.Done, snap.Total, snap.Final)
+	writeVTT(w, r, snap.Body, snap.Done, snap.Total, snap.Final, false)
 }
 
 func (h *Handler) fetchDoc(ctx context.Context, sourceURL string) (*Doc, *clientError) {
@@ -312,12 +417,21 @@ func (h *Handler) fetchDoc(ctx context.Context, sourceURL string) (*Doc, *client
 	return doc, nil
 }
 
-func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total int, final bool) {
+// writeVTT renders a response. live sets X-Subtitle-Live and adds it to the
+// exposed header list; a non-live response keeps the exact header set it
+// had before live sources existed, since it is polled the same way whether
+// or not this build knows about live sources at all.
+func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total int, final, live bool) {
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	w.Header().Set("X-Subtitle-Progress", strconv.Itoa(done)+"/"+strconv.Itoa(total))
-	// The player polls this header cross-origin (the proxy adds
-	// Access-Control-Allow-Origin itself and passes this one through).
-	w.Header().Set("Access-Control-Expose-Headers", "X-Subtitle-Progress")
+	// The player polls these headers cross-origin (the proxy adds
+	// Access-Control-Allow-Origin itself and passes these through).
+	expose := "X-Subtitle-Progress"
+	if live {
+		w.Header().Set("X-Subtitle-Live", "1")
+		expose = "X-Subtitle-Progress, X-Subtitle-Live"
+	}
+	w.Header().Set("Access-Control-Expose-Headers", expose)
 	if final {
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 	} else {
@@ -328,4 +442,11 @@ func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total i
 		return
 	}
 	_, _ = w.Write(body)
+}
+
+// writeVTTLive renders a Snapshot from a live source: Live decides whether
+// X-Subtitle-Live is set, on top of the same done/total/final contract a
+// regular track's snapshot uses.
+func writeVTTLive(w http.ResponseWriter, r *http.Request, body []byte, snap *Snapshot) {
+	writeVTT(w, r, body, snap.Done, snap.Total, snap.Final, snap.Live)
 }

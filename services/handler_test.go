@@ -350,3 +350,95 @@ func TestHandlerCachesParsedSource(t *testing.T) {
 		t.Fatalf("source fetched %d times, want 1", n)
 	}
 }
+
+func newLiveHandlerForTest(t *testing.T, tr Translator) (*Handler, *livePlaylistServer) {
+	t.Helper()
+	srv := newLivePlaylistServer(t)
+	r := NewRunner(NewMemoryStore(), tr, 3, 4, time.Minute)
+	r.SetLive(LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: 20 * time.Millisecond, Idle: time.Minute})
+	t.Cleanup(r.Close)
+	h := &Handler{Runner: r, Model: "m", Client: srv.srv.Client(), MaxSourceBytes: 1 << 20, MaxCues: 5000}
+	return h, srv
+}
+
+func doLive(h http.Handler, method, sourceURL string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, "/s0.vtt", nil)
+	req.Header.Set("X-Mod-Extra", "pt")
+	req.Header.Set("X-Info-Hash", "abc")
+	req.Header.Set("X-Path", "/a.mkv~hls/session/0123456789abcdef0123456789abcdef/s0.m3u8")
+	req.Header.Set("X-Source-Url", sourceURL)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestHandlerLivePlaylistSource(t *testing.T) {
+	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0, "s0-1.vtt": seg1})
+	rec := doLive(h, "GET", srv.url())
+	if rec.Code != 200 || rec.Header().Get("X-Subtitle-Live") != "1" || rec.Header().Get("X-Subtitle-Progress") != "0/1" {
+		t.Fatalf("code=%d live=%q progress=%q", rec.Code, rec.Header().Get("X-Subtitle-Live"), rec.Header().Get("X-Subtitle-Progress"))
+	}
+	if !strings.Contains(rec.Header().Get("Access-Control-Expose-Headers"), "X-Subtitle-Live") {
+		t.Fatalf("expose: %q", rec.Header().Get("Access-Control-Expose-Headers"))
+	}
+	if strings.Contains(rec.Body.String(), "Макс") {
+		t.Fatal("untranslated cue must not be in the live body")
+	}
+	time.Sleep(80 * time.Millisecond)
+	rec = doLive(h, "HEAD", srv.url())
+	if rec.Header().Get("X-Subtitle-Progress") != "1/1" || rec.Header().Get("X-Subtitle-Live") != "1" {
+		t.Fatalf("after timer batch: %q live=%q", rec.Header().Get("X-Subtitle-Progress"), rec.Header().Get("X-Subtitle-Live"))
+	}
+	srv.set(pl2end, nil)
+	h.Runner.Wait(ArtifactKey("abc", "/a.mkv~hls/s0.m3u8", "pt", "m", PromptVersion))
+	rec = doLive(h, "GET", srv.url())
+	if rec.Header().Get("X-Subtitle-Live") != "" || rec.Header().Get("Cache-Control") != "public, max-age=86400" || !strings.Contains(rec.Body.String(), "PT:Привет.") {
+		t.Fatalf("final: live=%q cc=%q body=%s", rec.Header().Get("X-Subtitle-Live"), rec.Header().Get("Cache-Control"), rec.Body.String())
+	}
+}
+
+func TestHandlerLiveKeyIgnoresSessionID(t *testing.T) {
+	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv.set(pl1+"#EXT-X-ENDLIST\n", map[string]string{"s0-0.vtt": seg0})
+	doLive(h, "GET", srv.url())
+	h.Runner.Wait(ArtifactKey("abc", "/a.mkv~hls/s0.m3u8", "pt", "m", PromptVersion))
+	req := httptest.NewRequest("GET", "/s0.vtt", nil)
+	req.Header.Set("X-Mod-Extra", "pt")
+	req.Header.Set("X-Info-Hash", "abc")
+	req.Header.Set("X-Path", "/a.mkv~hls/session/ffffffffffffffffffffffffffffffff/s0.m3u8")
+	req.Header.Set("X-Source-Url", "http://127.0.0.1:1/dead~hls/session/ffffffffffffffffffffffffffffffff/s0.m3u8")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 || rec.Header().Get("Cache-Control") != "public, max-age=86400" {
+		t.Fatalf("second session must hit the final of the first: code=%d cc=%q", rec.Code, rec.Header().Get("Cache-Control"))
+	}
+}
+
+func TestHandlerLiveNewSessionReplacesStaleSource(t *testing.T) {
+	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	doLive(h, "GET", srv.url())
+	// Same key, another source URL (a new transcoder session): the cached
+	// LiveSource for the old URL must be replaced, not reused.
+	other := strings.Replace(srv.url(), "token=T", "token=T2", 1)
+	rec := doLive(h, "GET", other)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	src, _ := h.lives.Get(ArtifactKey("abc", "/a.mkv~hls/s0.m3u8", "pt", "m", PromptVersion), func() (*LiveSource, error) { t.Fatal("must already be cached"); return nil, nil })
+	if src.url != other {
+		t.Fatalf("stale source kept: %s", src.url)
+	}
+}
+
+func TestHandlerLiveGoneSourceIs404(t *testing.T) {
+	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv.mu.Lock()
+	srv.status = 404
+	srv.mu.Unlock()
+	rec := doLive(h, "GET", srv.url())
+	if rec.Code != 404 || rec.Body.String() != msgSourceUnavail+"\n" {
+		t.Fatalf("code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
