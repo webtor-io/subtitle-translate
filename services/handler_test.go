@@ -415,20 +415,65 @@ func TestHandlerLiveKeyIgnoresSessionID(t *testing.T) {
 	}
 }
 
+// waitRunnerKey blocks until the in-process job for key exits, or fails
+// the test after d: a regression that leaves the stale job polling forever
+// (e.g. the retire-before-drop call removed) must fail fast, not hang the
+// suite.
+func waitRunnerKey(t *testing.T, r *Runner, key string, d time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { r.Wait(key); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("job for key did not exit within %s", d)
+	}
+}
+
 func TestHandlerLiveNewSessionReplacesStaleSource(t *testing.T) {
-	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
-	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
-	doLive(h, "GET", srv.url())
-	// Same key, another source URL (a new transcoder session): the cached
-	// LiveSource for the old URL must be replaced, not reused.
-	other := strings.Replace(srv.url(), "token=T", "token=T2", 1)
-	rec := doLive(h, "GET", other)
+	h, srv1 := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv1.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	doLive(h, "GET", srv1.url())
+
+	// A second transcoder session for the same key (X-Path carries the same
+	// session id — doLive always sends it — since KeyPath strips it either
+	// way): a genuinely different source URL, a separate server rather than
+	// just a different query parameter, ending in its own distinct cue so
+	// the eventual final artifact can only have come from this source.
+	srv2 := newLivePlaylistServer(t)
+	const seg2 = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nВторая сессия.\n"
+	srv2.set(pl1+"#EXT-X-ENDLIST\n", map[string]string{"s0-0.vtt": seg2})
+
+	key := ArtifactKey("abc", "/a.mkv~hls/s0.m3u8", "pt", "m", PromptVersion)
+
+	rec := doLive(h, "GET", srv2.url())
 	if rec.Code != 200 {
 		t.Fatalf("code=%d", rec.Code)
 	}
-	src, _ := h.lives.Get(ArtifactKey("abc", "/a.mkv~hls/s0.m3u8", "pt", "m", PromptVersion), func() (*LiveSource, error) { t.Fatal("must already be cached"); return nil, nil })
-	if src.url != other {
+	// The cache must already hold the new source: liveFor replaces a
+	// mismatched URL synchronously, within this same request.
+	src, _ := h.lives.Get(key, func() (*LiveSource, error) { t.Fatal("must already be cached"); return nil, nil })
+	if src.url != srv2.url() {
 		t.Fatalf("stale source kept: %s", src.url)
+	}
+
+	// The first request's Ensure(Live: src2) was silently dropped — the old
+	// job (against srv1) still owned the key. That old job must retire on
+	// its own, via the source this GET just retired, rather than the test
+	// waiting out srv1's eventual (here: never, since srv1 stays up and
+	// never 404s) source_gone.
+	waitRunnerKey(t, h.Runner, key, 2*time.Second)
+
+	// Now that the key is free, the next GET's Ensure actually starts a job
+	// against the new source.
+	if rec := doLive(h, "GET", srv2.url()); rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	waitRunnerKey(t, h.Runner, key, 2*time.Second)
+
+	rec = doLive(h, "GET", srv2.url())
+	if !strings.Contains(rec.Body.String(), "PT:Вторая сессия.") {
+		t.Fatalf("final body must come from the new session: %s", rec.Body.String())
 	}
 }
 

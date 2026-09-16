@@ -218,6 +218,13 @@ func (h *Handler) liveFor(key, sourceURL string) *LiveSource {
 	}
 	src, _ := cache.Get(key, newSource)
 	if src.url != sourceURL {
+		// Retire before dropping: a job may still be mid-poll against the
+		// stale source (Ensure is a no-op while a job for key is already
+		// running, so this request's own Ensure below will not replace it),
+		// and without this it would keep polling the dead URL for up to one
+		// more PollInterval — plus any in-flight batch — before noticing on
+		// its own.
+		src.Retire()
 		cache.Drop(key)
 		src, _ = cache.Get(key, newSource)
 	}
@@ -313,7 +320,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// regular source's fetch failure is, instead of surfacing only on
 		// the background job's next tick.
 		if src.Doc().Len() == 0 {
-			if _, rerr := src.Refresh(ctx); rerr != nil {
+			// The source is cached and shared with whoever polls this key
+			// next, so — like docFor's fetch — this priming read must not
+			// die with this request's own connection.
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sourceFetchTimeout)
+			_, rerr := src.Refresh(rctx)
+			cancel()
+			if rerr != nil {
 				switch {
 				case errors.Is(rerr, ErrSourceGone):
 					logger.WithError(rerr).Warn("live source unavailable")

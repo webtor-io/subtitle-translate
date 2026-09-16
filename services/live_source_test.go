@@ -199,3 +199,29 @@ func TestLiveSourceCueCap(t *testing.T) {
 		t.Fatalf("doc len=%d, want 3 (cap checked after AddSegment already applied it)", got)
 	}
 }
+
+// TestLiveSourceRetireEndsFutureRefreshes pins Retire's contract: once
+// called, every subsequent Refresh returns ErrSourceGone without touching
+// the network, so a job still polling a source the handler has replaced in
+// its cache exits on its very next tick instead of waiting for the
+// transcoder's own 404.
+func TestLiveSourceRetireEndsFutureRefreshes(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	ls.Retire()
+	if _, err := ls.Refresh(context.Background()); !errors.Is(err, ErrSourceGone) {
+		t.Fatalf("want gone after retire, got %v", err)
+	}
+
+	srv.mu.Lock()
+	hits := srv.hits["/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/s0.m3u8"]
+	srv.mu.Unlock()
+	if hits != 1 {
+		t.Fatalf("refresh after retire must not touch the network: playlist hits=%d, want 1", hits)
+	}
+}
