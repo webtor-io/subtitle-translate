@@ -982,6 +982,22 @@ func (s *lockCountingStore) TryLock(ctx context.Context, key string, ttl time.Du
 
 func (s *lockCountingStore) count() int32 { return atomic.LoadInt32(&s.locks) }
 
+// waitStoreCount blocks until the lock-counting store has seen at least want
+// TryLock calls. Ensure only sets up the running entry synchronously and
+// returns; the goroutine it spawns reaches TryLock on its own schedule, so a
+// caller that wants to assert "the job was started" reads the count through
+// this rather than immediately after the triggering request returns.
+func waitStoreCount(t *testing.T, s *lockCountingStore, want int32) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if s.count() >= want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d TryLock calls, got %d", want, s.count())
+}
+
 // plSeekEnd is a run that joined after a seek (a non-zero session offset,
 // so the document has a hole no reader could detect) and then ended. No
 // final artifact may be written from it — which is exactly the state that
@@ -1021,6 +1037,121 @@ func TestHandlerLiveEndedSeekedRunStopsRestartingJobs(t *testing.T) {
 	waitRunnerKey(t, h.Runner, key, 3*time.Second)
 	if got := st.count(); got != started+1 {
 		t.Fatalf("a new session started %d jobs, want 1", got-started)
+	}
+}
+
+// TestHandlerLiveSecondSeekStartsAJobAgain is N1: a seek does not start a
+// new transcoder session, it keeps the same session id and playlist URL
+// and rewrites it with a new #EXT-X-SESSION-OFFSET (and, while the
+// transcoder is still producing the run, no #EXT-X-ENDLIST). So the first
+// seeked run above (plSeekEnd) ending and marking the source RunEnded must
+// not be the last word: a second seek that brings new cues on the same
+// source has to re-arm the job, or the viewer never gets another
+// translation for the rest of the session.
+func TestHandlerLiveSecondSeekStartsAJobAgain(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(plSeekEnd, map[string]string{"s0-0.vtt": seg0})
+	st := &lockCountingStore{Store: NewMemoryStore()}
+	ft := &fakeTranslator{}
+	r := NewRunner(st, ft, 3, 4, time.Minute)
+	// Idle is short enough that the test can wait out a real job exit
+	// instead of guessing at a sleep, but wide enough (relative to
+	// BatchWait and to how often the test itself polls) that scheduling
+	// jitter on a loaded machine cannot idle the job out from under a test
+	// that is still actively polling it — see N5 in the review for why a
+	// thin margin here is a red-flaky trap, not a green one.
+	// PollInterval/BatchWait match the other live handler tests.
+	r.SetLive(LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: 20 * time.Millisecond, Idle: 300 * time.Millisecond})
+	t.Cleanup(r.Close)
+	h := &Handler{Runner: r, Model: "m", Client: srv.srv.Client(), MaxSourceBytes: 1 << 20, MaxCues: 5000}
+	key := ArtifactKey("abc", "/a.mkv~hls/s0.m3u8", "pt", "m", PromptVersion)
+
+	// Run 1: joins after a seek and ends at once (same shape as F6).
+	if rec := doLive(h, "GET", srv.url()); rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	waitRunnerKey(t, h.Runner, key, 3*time.Second)
+	started := st.count()
+	if started != 1 {
+		t.Fatalf("the first GET started %d jobs, want 1", started)
+	}
+	waitForCalls(t, ft, 1)
+
+	// A few more polls of the unchanged, ended playlist: still no restart
+	// (F6's guarantee, unaffected by this fix).
+	for i := 0; i < 10; i++ {
+		if rec := doLive(h, "GET", srv.url()); rec.Code != 200 {
+			t.Fatalf("poll %d: code=%d", i, rec.Code)
+		}
+	}
+	waitRunnerKey(t, h.Runner, key, 3*time.Second)
+	if got := st.count(); got != started {
+		t.Fatalf("%d jobs started after the run ended with nothing left to do", got-started)
+	}
+
+	// Let the staleness gate (maxAge == PollInterval == 10ms) clear with a
+	// comfortable margin, so the next poll actually re-fetches the playlist
+	// instead of answering from the cached "nothing changed" fast path.
+	time.Sleep(50 * time.Millisecond)
+
+	// The viewer seeks again. Same session, same playlist URL — the
+	// transcoder rewrites it in place with a new offset and a new segment,
+	// still live (no ENDLIST): the run is not over, it moved.
+	const plSecondRun = "#EXTM3U\n#EXT-X-SESSION-OFFSET:300\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-TARGETDURATION:64\n#EXTINF:63.7,\ns1-0.vtt?token=T\n"
+	const seg1b = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nВторой запуск.\n"
+	srv.set(plSecondRun, map[string]string{"s1-0.vtt": seg1b})
+
+	rec := doLive(h, "GET", srv.url())
+	if rec.Code != 200 {
+		t.Fatalf("second seek: code=%d", rec.Code)
+	}
+	// Ensure only sets up the running entry synchronously; the goroutine it
+	// spawns reaches the store's TryLock (what lockCountingStore counts) on
+	// its own schedule, so the count is read through a bounded wait rather
+	// than trusted the instant the response comes back.
+	waitStoreCount(t, st, started+1)
+	// The new cue reached the document (the handler refreshes before
+	// Ensure), but the store still holds run 1's record: total grows to 2,
+	// only the first cue is done yet.
+	if p := rec.Header().Get("X-Subtitle-Progress"); p != "1/2" {
+		t.Fatalf("progress=%q, want 1/2 right after the second seek started the job", p)
+	}
+
+	// Poll until the second cue is translated, the same way a real viewer's
+	// player would: every poll also Touches the key, which is what keeps
+	// the job from going idle while it waits out BatchWait for its one
+	// cue. (A bare wait on the translator call count, with no polling in
+	// between, starves that Touch and races the job's own Idle timeout —
+	// this loop is the fix for that, not a sleep.) Along the way the
+	// record must say live again: this run has not ended, only paused
+	// between batches.
+	sawLive := false
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rec = doLive(h, "GET", srv.url())
+		if rec.Header().Get("X-Subtitle-Live") == "1" {
+			sawLive = true
+		}
+		if rec.Header().Get("X-Subtitle-Progress") == "2/2" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("progress never reached 2/2: last=%q live=%q", rec.Header().Get("X-Subtitle-Progress"), rec.Header().Get("X-Subtitle-Live"))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !sawLive {
+		t.Fatal("X-Subtitle-Live never came back to 1 while the second run was translating")
+	}
+	waitForCalls(t, ft, 2)
+	// Read while the job is still fresh (we have been polling it every
+	// ~5ms, well inside Idle): exactly one job was started for the second
+	// run, not one per poll of the still-pending cue. Polling again after
+	// letting the job idle out would legitimately start a further job —
+	// that is keepAlive's documented "paused, not ended" contract, a
+	// different behaviour from this test's subject and not asserted here.
+	if got := st.count(); got != started+1 {
+		t.Fatalf("%d jobs started for the second run, want 1", got-started)
 	}
 }
 

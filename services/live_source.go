@@ -374,6 +374,25 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 	if pl.Ended {
 		s.ended = true
 	}
+	// A playlist that is live again (no ENDLIST) and carries new cues is a
+	// new run, not a continuation of whatever the previous run concluded:
+	// clear the sticky mark so a HEAD/GET in between reports live again,
+	// and so the job that picks the source back up follows this run to its
+	// own ENDLIST instead of treating the first batch as final because the
+	// mark was still set from before.
+	if !pl.Ended && out.Added > 0 {
+		s.ended = false
+	}
+	if out.Added > 0 {
+		// New cues are new work, whatever the source concluded before: the
+		// runEnded mark only ever said the PREVIOUS run finished with
+		// nothing left to do, not that nothing can ever happen against this
+		// source again. A seek keeps the same session and playlist URL, so
+		// without this a run that ends and is later reused by a second seek
+		// stays marked forever and Ensure refuses to start a job for it
+		// (job.go), leaving the viewer stuck.
+		s.runEnded = false
+	}
 	out.Ended = s.ended
 	s.lastRefresh = time.Now()
 	s.mu.Unlock()
