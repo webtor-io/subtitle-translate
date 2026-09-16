@@ -22,6 +22,18 @@ type Progress struct {
 	// no final artifact, which is how a reader tells "still coming" from
 	// "this is all there will be".
 	Live bool
+	// Status is the terminal state of a live run that stopped: "done" (an
+	// ENDLIST was reached and everything pending was translated, whether or
+	// not a final artifact came out of it) or "stopped" (the source went
+	// away, or outgrew its caps, before that). Empty means neither — the
+	// job is running, idle-paused, or this record predates the field. Set
+	// only alongside Live=false (see stopLive), and cleared back to empty
+	// the moment a new run re-arms the job, so a stale terminal value from
+	// the previous run is never read as this one's.
+	//
+	// A gob-compatible addition: appended at the end, so a record encoded
+	// before this field existed decodes with Status == "".
+	Status string
 }
 
 type Store interface {
@@ -85,7 +97,7 @@ func (m *MemoryStore) GetProgress(_ context.Context, key string) (*Progress, err
 		return nil, nil
 	}
 	cp := &Progress{Total: p.Total, Lines: append([]string(nil), p.Lines...),
-		CueKeys: append([]string(nil), p.CueKeys...), Live: p.Live}
+		CueKeys: append([]string(nil), p.CueKeys...), Live: p.Live, Status: p.Status}
 	return cp, nil
 }
 
@@ -93,7 +105,7 @@ func (m *MemoryStore) PutProgress(_ context.Context, key string, p *Progress) er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.progress[key] = &Progress{Total: p.Total, Lines: append([]string(nil), p.Lines...),
-		CueKeys: append([]string(nil), p.CueKeys...), Live: p.Live}
+		CueKeys: append([]string(nil), p.CueKeys...), Live: p.Live, Status: p.Status}
 	return nil
 }
 

@@ -36,6 +36,11 @@ type Snapshot struct {
 	// Live says more cues are still coming, so Done/Total describe the
 	// document so far rather than the whole track. Only live sources set it.
 	Live bool
+	// Status carries Progress.Status through to the response for a live
+	// source: "done", "stopped", or "" (running, idle-paused, or an
+	// offline snapshot, which never sets this). Empty means the header
+	// stays off; only writeVTT decides that.
+	Status string
 }
 
 type Runner struct {

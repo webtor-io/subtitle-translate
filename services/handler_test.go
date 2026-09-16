@@ -1029,6 +1029,15 @@ func TestHandlerLiveEndedSeekedRunStopsRestartingJobs(t *testing.T) {
 	if got := st.count(); got != started {
 		t.Fatalf("%d jobs started after the run ended with nothing left to do", got-started)
 	}
+	// ENDLIST reached, everything pending translated, no final artifact
+	// (the run is non-contiguous): statusDone, X-Subtitle-Live absent.
+	statusRec := doLive(h, "HEAD", srv.url())
+	if statusRec.Header().Get("X-Subtitle-Status") != "done" || statusRec.Header().Get("X-Subtitle-Live") != "" {
+		t.Fatalf("status=%q live=%q, want status=done live absent", statusRec.Header().Get("X-Subtitle-Status"), statusRec.Header().Get("X-Subtitle-Live"))
+	}
+	if !strings.Contains(statusRec.Header().Get("Access-Control-Expose-Headers"), "X-Subtitle-Status") {
+		t.Fatalf("expose: %q", statusRec.Header().Get("Access-Control-Expose-Headers"))
+	}
 	// A new transcoder session is new work: the rule is "this source is
 	// finished", not "this key is finished".
 	if rec := doLive(h, "GET", srv.urlForSession("ffffffffffffffffffffffffffffffff")); rec.Code != 200 {
@@ -1076,6 +1085,15 @@ func TestHandlerLiveSecondSeekStartsAJobAgain(t *testing.T) {
 		t.Fatalf("the first GET started %d jobs, want 1", started)
 	}
 	waitForCalls(t, ft, 1)
+
+	// Run 1 reached ENDLIST on a non-contiguous run: everything pending was
+	// translated, no final artifact will ever come from it. That is
+	// statusDone, and it must be readable before the seek that re-arms the
+	// job — this is the "done" half of X-Subtitle-Status, the other half of
+	// which (statusStopped) is covered by TestHandlerLiveStatusStopped.
+	if rec := doLive(h, "HEAD", srv.url()); rec.Header().Get("X-Subtitle-Status") != "done" || rec.Header().Get("X-Subtitle-Live") != "" {
+		t.Fatalf("after run 1 ends: status=%q live=%q, want status=done live absent", rec.Header().Get("X-Subtitle-Status"), rec.Header().Get("X-Subtitle-Live"))
+	}
 
 	// A few more polls of the unchanged, ended playlist: still no restart
 	// (F6's guarantee, unaffected by this fix).
@@ -1143,6 +1161,13 @@ func TestHandlerLiveSecondSeekStartsAJobAgain(t *testing.T) {
 	if !sawLive {
 		t.Fatal("X-Subtitle-Live never came back to 1 while the second run was translating")
 	}
+	// The re-armed job cleared the stale "done" the first run left behind
+	// (runLive's first act on a picked-up record, alongside Live=true): by
+	// the time progress reads 2/2 the job has ticked at least once, so this
+	// is not the same race the progress/live fields above poll around.
+	if got := rec.Header().Get("X-Subtitle-Status"); got != "" {
+		t.Fatalf("status=%q while the second run is still going, want absent", got)
+	}
 	waitForCalls(t, ft, 2)
 	// Read while the job is still fresh (we have been polling it every
 	// ~5ms, well inside Idle): exactly one job was started for the second
@@ -1153,6 +1178,68 @@ func TestHandlerLiveSecondSeekStartsAJobAgain(t *testing.T) {
 	if got := st.count(); got != started+1 {
 		t.Fatalf("%d jobs started for the second run, want 1", got-started)
 	}
+}
+
+// TestHandlerLiveStatusStoppedFromStore is the "stopped" half of
+// X-Subtitle-Status. Driving a real source_gone through the ticker races the
+// handler's own liveRefresh against the same staleness window the job's
+// failed attempt just stamped (TestHandlerLiveGoneCurrentSourceStillIs404
+// exists because that path answers 404, not 200, once the window lapses),
+// so what stopLive writes is asserted directly against the store instead —
+// the same way TestLiveProgressMatchesSnapshotWithoutABody primes a record
+// to pin LiveProgress/LiveSnapshot's contract without racing a real fetch.
+func TestHandlerLiveStatusStoppedFromStore(t *testing.T) {
+	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	key := ArtifactKey("abc", "/a.mkv~hls/s0.m3u8", "pt", "m", PromptVersion)
+	// HEAD alone never starts a job (TestHeadDoesNotStartJob); it only
+	// primes the handler's live-source cache so the poll below has a
+	// document to align the stored record against.
+	if rec := doLive(h, "HEAD", srv.url()); rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if err := h.Runner.store.PutProgress(context.Background(), key, &Progress{Total: 1, Live: false, Status: statusStopped}); err != nil {
+		t.Fatal(err)
+	}
+	rec := doLive(h, "HEAD", srv.url())
+	if rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if rec.Header().Get("X-Subtitle-Status") != "stopped" || rec.Header().Get("X-Subtitle-Live") != "" {
+		t.Fatalf("status=%q live=%q, want status=stopped live absent", rec.Header().Get("X-Subtitle-Status"), rec.Header().Get("X-Subtitle-Live"))
+	}
+	if !strings.Contains(rec.Header().Get("Access-Control-Expose-Headers"), "X-Subtitle-Status") {
+		t.Fatalf("expose: %q", rec.Header().Get("Access-Control-Expose-Headers"))
+	}
+}
+
+// TestOfflineNeverCarriesSubtitleStatus is the negative side of
+// X-Subtitle-Status: Progress.Status is only ever written by the live path
+// (stopLive), and offline requests never reach it — GetFinal's early
+// return skips the live branch entirely, and the plain HEAD/GET paths
+// below it never read Status at all — so neither method may carry the
+// header at any point in an offline job's lifecycle, including once it is
+// final (the file/offline case the README's "absent otherwise" refers to).
+func TestOfflineNeverCarriesSubtitleStatus(t *testing.T) {
+	ft := &fakeTranslator{}
+	h, src := newHandlerForTest(t, ft, vttWith(2))
+	path := "/abc/movie.srt~vtt/movie.vtt~tr:pt/movie.vtt"
+	assertNoStatus := func(t *testing.T, rec *httptest.ResponseRecorder, when string) {
+		t.Helper()
+		if got := rec.Header().Get("X-Subtitle-Status"); got != "" {
+			t.Fatalf("%s: status=%q, offline responses must never carry it", when, got)
+		}
+		if strings.Contains(rec.Header().Get("Access-Control-Expose-Headers"), "X-Subtitle-Status") {
+			t.Fatalf("%s: expose leaked X-Subtitle-Status: %q", when, rec.Header().Get("Access-Control-Expose-Headers"))
+		}
+	}
+	assertNoStatus(t, do(h, "HEAD", path, src.URL), "HEAD before any job")
+	rec := do(h, "GET", path, src.URL)
+	assertNoStatus(t, rec, "GET starting the job")
+	assertNoStatus(t, do(h, "HEAD", path, src.URL), "HEAD mid-job")
+	h.Runner.Wait(ArtifactKey("abc", "/movie.srt~vtt/movie.vtt", "pt", "m", PromptVersion))
+	assertNoStatus(t, do(h, "GET", path, src.URL), "GET against the final artifact")
+	assertNoStatus(t, do(h, "HEAD", path, src.URL), "HEAD against the final artifact")
 }
 
 // TestSyncLiveKeepsDisplacedTranslations is F1: a source whose document

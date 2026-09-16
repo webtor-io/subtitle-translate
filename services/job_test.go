@@ -414,6 +414,64 @@ func TestLiveRunnerStopsOnSourceGone(t *testing.T) {
 	if p == nil || p.Live {
 		t.Fatalf("gone source must clear Live and keep progress: %+v", p)
 	}
+	if p.Status != statusStopped {
+		t.Fatalf("gone source must record Status=stopped, got %q", p.Status)
+	}
+}
+
+// TestLiveRunnerNoFinalAfterSeekRecordsStatusDone is the other stopLive
+// caller in finishLive: a run that reaches ENDLIST with everything pending
+// translated, but cannot write a final artifact because it joined after a
+// seek, is still "done" — not "stopped" — because nothing was cut short.
+func TestLiveRunnerNoFinalAfterSeekRecordsStatusDone(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	seek := "#EXTM3U\n#EXT-X-SESSION-OFFSET:600\n#EXTINF:2.0,\ns0-0.vtt?token=T\n#EXT-X-ENDLIST\n"
+	srv.set(seek, map[string]string{"s0-0.vtt": seg0})
+	r, st := newLiveRunner(t, &fakeTranslator{}, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	r.Wait("k")
+	p, _ := st.GetProgress(context.Background(), "k")
+	if p == nil || p.Live || p.Status != statusDone {
+		t.Fatalf("seeked run that reached ENDLIST must record Status=done: %+v", p)
+	}
+}
+
+// TestLiveRunnerClearsStatusOnRearm is the guard on runLive's own doc
+// comment: a record a re-armed job picks up must not go on reporting the
+// previous run's terminal Status once this run is, once again, undecided.
+func TestLiveRunnerClearsStatusOnRearm(t *testing.T) {
+	st := NewMemoryStore()
+	if err := st.PutProgress(context.Background(), "k", &Progress{Total: 1, Lines: []string{"PT:x"}, Live: false, Status: statusDone}); err != nil {
+		t.Fatal(err)
+	}
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	r := NewRunner(st, &fakeTranslator{}, 50, 4, time.Minute)
+	r.SetLive(LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute})
+	t.Cleanup(r.Close)
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	// runLive sets Live=true/Status="" on the record it loaded before its
+	// first tick, but only persists on that tick (the store write above
+	// primed the on-disk record, not the goroutine's local copy) — so this
+	// polls for the write rather than sleeping past one PollInterval.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		p, _ := st.GetProgress(context.Background(), "k")
+		if p != nil && p.Live {
+			if p.Status != "" {
+				t.Fatalf("a re-armed run must clear the previous run's Status, got %q", p.Status)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("runLive never wrote its first record")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func TestLiveRunnerReusesTranslationsByCueKey(t *testing.T) {
@@ -644,12 +702,12 @@ func TestLiveProgressMatchesSnapshotWithoutABody(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		done, total, live, err := r.LiveProgress(context.Background(), "k", ls)
+		done, total, live, status, err := r.LiveProgress(context.Background(), "k", ls)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if done != snap.Done || total != snap.Total || live != snap.Live {
-			t.Fatalf("%s: progress=%d/%d live=%v, snapshot=%d/%d live=%v", what, done, total, live, snap.Done, snap.Total, snap.Live)
+		if done != snap.Done || total != snap.Total || live != snap.Live || status != snap.Status {
+			t.Fatalf("%s: progress=%d/%d live=%v status=%q, snapshot=%d/%d live=%v status=%q", what, done, total, live, status, snap.Done, snap.Total, snap.Live, snap.Status)
 		}
 	}
 

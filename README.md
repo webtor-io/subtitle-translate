@@ -37,6 +37,21 @@ Response headers:
   `Cache-Control: no-store` on a partial (in-progress) response.
 - `X-Subtitle-Live: 1` — set only when `X-Source-Url` is a live HLS subtitle
   playlist and the job is not finished yet. See [Live HLS source](#live-hls-source).
+- `X-Subtitle-Status: done|stopped` — set only when `X-Source-Url` is a live
+  HLS subtitle playlist and the run has reached a terminal state:
+  - `done` — the playlist reached `#EXT-X-ENDLIST` and every pending cue was
+    translated, whether or not that produced a final artifact (a run that
+    joined after a seek reaches this state too — see [Live HLS source](#live-hls-source)
+    — and still may not write one).
+  - `stopped` — the run was cut short: the transcoder session went away, or
+    the source outgrew `--max-source-bytes`/`--max-cues`, before it finished.
+  - Absent for every other live response (still running, or paused because
+    nobody polled the key for a while — see `--live-idle`) and for every
+    offline/file-source response, live or not: a finished offline artifact
+    signals through `Cache-Control: public, max-age=86400` instead, the same
+    as before this header existed.
+  - A later transcoder session on the same key is new work and starts
+    without this header, even if the previous session ended `done`.
 
 Status codes:
 
@@ -94,7 +109,10 @@ a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
 - The job stops on its own when nobody polled the key for `--live-idle`:
   reading the playlist keeps the transcoder session alive, so an unwatched
   translation would otherwise transcode the whole file for nobody. It also stops
-  when the session is gone (404/503 from the transcoder), keeping progress.
+  when the session is gone (404/503 from the transcoder) or the source outgrew
+  its caps, keeping progress. The idle stop leaves the record live (it is a
+  pause, not an end — the next poll resumes it); the other two set
+  `X-Subtitle-Status: stopped` on it (see [Response headers](#called-by-torrent-http-proxy)).
 - A segment that fails three times in a row is given up on — marked seen,
   counted by `subtitle_translate_live_segments_skipped_total`, and left as a
   hole that stops the run from writing a final artifact — because one segment
@@ -119,9 +137,14 @@ a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
   platform today. Without the window the replayed range is translated and
   rendered twice.
 - A run that ends without producing a final artifact (it joined after a seek,
-  so the document has holes) is finished for good: the record is written with
-  the live flag cleared, and no later poll starts another job against that
-  source. The next transcoder session is new work.
+  so the document has holes) is finished for good *for that run*: the record
+  is written with the live flag cleared and `X-Subtitle-Status: done` (it did
+  reach `#EXT-X-ENDLIST` with nothing left pending — a final artifact is a
+  separate question from whether the run is done), and no later poll starts
+  another job against that source. A seek that brings the same session new
+  cues re-arms it — the run is not over, it moved — which is also what clears
+  `X-Subtitle-Status` back off until this run reaches its own end. A genuinely
+  new transcoder session is new work regardless.
 - Live jobs are bounded by `--live-max-jobs`, separately from `--max-jobs`: a
   live job holds its slot for the length of a film while doing almost nothing,
   so queueing it behind offline work (or offline work behind it) is the wrong

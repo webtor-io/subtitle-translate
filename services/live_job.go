@@ -108,11 +108,16 @@ func (r *Runner) LiveSnapshot(ctx context.Context, key string, src *LiveSource) 
 	// stopped early (the source went away, or outgrew its caps) clears it
 	// while the playlist is still, formally, unfinished. No record yet means
 	// the job has not written its first tick, which is as live as it gets.
+	status := ""
+	if p != nil {
+		status = p.Status
+	}
 	return &Snapshot{
-		Body:  body,
-		Done:  countDoneByIndex(lines, doc),
-		Total: len(doc.Cues),
-		Live:  p == nil || p.Live,
+		Body:   body,
+		Done:   countDoneByIndex(lines, doc),
+		Total:  len(doc.Cues),
+		Live:   p == nil || p.Live,
+		Status: status,
 	}, nil
 }
 
@@ -302,6 +307,13 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		p = &Progress{}
 	}
 	p.Live = true
+	// A record this run picked up may carry a terminal Status from a
+	// previous run of the same source (RunEnded cleared by fresh cues —
+	// see live_source.go — is what re-arms the job at all). That value
+	// described a run that is no longer this one, so it is cleared here,
+	// in the same place Live is forced back to true, rather than left to
+	// read as this run's own outcome before this run has one.
+	p.Status = ""
 	targetName, _ := LangName(job.Lang)
 	ticker := time.NewTicker(r.live.PollInterval)
 	defer ticker.Stop()
@@ -322,12 +334,12 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		case errors.Is(err, ErrSourceGone):
 			logger.Info("source gone, stopping")
 			JobErrors.WithLabelValues("source_gone").Inc()
-			r.stopLive(ctx, key, logger, p)
+			r.stopLive(ctx, key, logger, p, statusStopped)
 			return
 		case errors.Is(err, ErrSourceTooLarge):
 			logger.Warn("source outgrew its caps, stopping")
 			JobErrors.WithLabelValues("too_large").Inc()
-			r.stopLive(ctx, key, logger, p)
+			r.stopLive(ctx, key, logger, p, statusStopped)
 			return
 		default:
 			if ctx.Err() != nil {
@@ -468,6 +480,12 @@ func (r *Runner) holdLock(ctx context.Context, key, token string, logger *log.En
 // translated. A final artifact is served forever and without a source, so
 // only a run that saw the whole movie may write one.
 func (r *Runner) finishLive(ctx context.Context, key string, logger *log.Entry, job *Job, p *Progress, doc *Doc, start time.Time) {
+	// Reaching this function already means what statusDone describes: the
+	// playlist ended and everything pending was translated (runLive only
+	// calls it when ref.Ended && pending == 0). Both branches below leave
+	// without a final artifact — one because the run cannot produce one,
+	// the other because rendering it failed — but neither changes that
+	// verdict, so both stop with the same status.
 	if !job.Live.Contiguous() {
 		// This run joined after a seek, so the document has holes no later
 		// reader could detect. The partial stays, the artifact is not written.
@@ -483,25 +501,35 @@ func (r *Runner) finishLive(ctx context.Context, key string, logger *log.Entry, 
 		// brings its own LiveSource and is new work.
 		job.Live.MarkRunEnded()
 		logger.Info("live source ended on a run that skipped ahead, keeping the partial")
-		r.stopLive(ctx, key, logger, p)
+		r.stopLive(ctx, key, logger, p, statusDone)
 		return
 	}
 	body, err := doc.RenderByIndex(p.Lines)
 	if err != nil {
 		JobErrors.WithLabelValues("render").Inc()
 		logger.WithError(err).Error("failed to render final")
-		r.stopLive(ctx, key, logger, p)
+		r.stopLive(ctx, key, logger, p, statusDone)
 		return
 	}
 	r.writeFinal(ctx, key, logger, body, start)
 }
 
+// Status values for Progress.Status — see the field's doc comment. These
+// are the only two terminal states stopLive ever writes, and the only two
+// values X-Subtitle-Status ever carries.
+const (
+	statusDone    = "done"
+	statusStopped = "stopped"
+)
+
 // stopLive is the last write of a live job that will not produce a final
 // artifact. Clearing Live is what tells a reader that what is stored is all
 // there will be; the partial itself stays for its TTL, so a viewer who
-// comes back does not start from zero.
-func (r *Runner) stopLive(ctx context.Context, key string, logger *log.Entry, p *Progress) {
+// comes back does not start from zero. status is recorded alongside, in
+// the same write, so a reader never sees Live=false without knowing why.
+func (r *Runner) stopLive(ctx context.Context, key string, logger *log.Entry, p *Progress, status string) {
 	p.Live = false
+	p.Status = status
 	r.putProgress(ctx, key, logger, p)
 }
 
@@ -526,19 +554,23 @@ func (r *Runner) LivePollInterval() time.Duration { return r.live.PollInterval }
 // same counts, no render. HEAD asks for exactly this, and rendering a whole
 // document into a response that discards it is the most expensive thing a
 // live key does per poll.
-func (r *Runner) LiveProgress(ctx context.Context, key string, src *LiveSource) (done, total int, live bool, err error) {
+func (r *Runner) LiveProgress(ctx context.Context, key string, src *LiveSource) (done, total int, live bool, status string, err error) {
 	if _, ok, err := r.store.GetFinal(ctx, key); err != nil {
-		return 0, 0, false, err
+		return 0, 0, false, "", err
 	} else if ok {
 		// Same convention as LiveSnapshot: a finished artifact has no cue
 		// count to report, and done == total reads as complete.
-		return 100, 100, false, nil
+		return 100, 100, false, "", nil
 	}
 	p, err := r.store.GetProgress(ctx, key)
 	if err != nil {
-		return 0, 0, false, err
+		return 0, 0, false, "", err
 	}
 	doc := src.Doc().Snapshot()
 	lines := alignLines(p, doc)
-	return countDoneByIndex(lines, doc), len(doc.Cues), p == nil || p.Live, nil
+	st := ""
+	if p != nil {
+		st = p.Status
+	}
+	return countDoneByIndex(lines, doc), len(doc.Cues), p == nil || p.Live, st, nil
 }

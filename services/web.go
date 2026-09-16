@@ -518,7 +518,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if found {
-		writeVTT(w, r, body, 100, 100, true, false)
+		writeVTT(w, r, body, 100, 100, true, false, "")
 		return
 	}
 	if u, perr := url.Parse(sourceURL); perr == nil && isPlaylistSource(u) {
@@ -577,13 +577,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// source below): it reports what is known without triggering
 			// or waiting on a translation. It also never renders — the body
 			// would be built and dropped on every poll of every viewer.
-			done, total, live, err := h.Runner.LiveProgress(ctx, key, src)
+			done, total, live, status, err := h.Runner.LiveProgress(ctx, key, src)
 			if err != nil {
 				logger.WithError(err).Error("live progress failed")
 				http.Error(w, msgUpstreamUnavail, http.StatusBadGateway)
 				return
 			}
-			writeVTT(w, r, nil, done, total, false, live)
+			writeVTT(w, r, nil, done, total, false, live, status)
 			return
 		}
 		h.Runner.Ensure(ctx, key, &Job{Lang: lang, SourceLang: ParseSourceLang(r.URL.Query().Get("srclang")), Glossary: ParseNames(r.URL.Query().Get("names")), Live: src})
@@ -620,7 +620,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				done = total
 			}
 		}
-		writeVTT(w, r, nil, done, total, false, false)
+		writeVTT(w, r, nil, done, total, false, false, "")
 		return
 	}
 	doc, cerr := h.docFor(ctx, key, sourceURL)
@@ -636,7 +636,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, msgUpstreamUnavail, http.StatusBadGateway)
 		return
 	}
-	writeVTT(w, r, snap.Body, snap.Done, snap.Total, snap.Final, false)
+	writeVTT(w, r, snap.Body, snap.Done, snap.Total, snap.Final, false, "")
 }
 
 func (h *Handler) fetchDoc(ctx context.Context, sourceURL string) (*Doc, *clientError) {
@@ -686,17 +686,28 @@ func (h *Handler) fetchDoc(ctx context.Context, sourceURL string) (*Doc, *client
 // exposed header list; a non-live response keeps the exact header set it
 // had before live sources existed, since it is polled the same way whether
 // or not this build knows about live sources at all.
-func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total int, final, live bool) {
+//
+// status is independent of live: a live source's job can conclude (Live
+// goes false) while the response is still, and only ever, about that live
+// source — "done" or "stopped" — so it is set whenever status is non-empty,
+// not only while live is true. An offline/file-source call site simply
+// never has a status to pass, so it never appears there. Every caller of
+// this function that is not on the live/playlist path passes "".
+func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total int, final, live bool, status string) {
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	w.Header().Set("X-Subtitle-Progress", strconv.Itoa(done)+"/"+strconv.Itoa(total))
 	// The player polls these headers cross-origin (the proxy adds
 	// Access-Control-Allow-Origin itself and passes these through).
-	expose := "X-Subtitle-Progress"
+	expose := []string{"X-Subtitle-Progress"}
 	if live {
 		w.Header().Set("X-Subtitle-Live", "1")
-		expose = "X-Subtitle-Progress, X-Subtitle-Live"
+		expose = append(expose, "X-Subtitle-Live")
 	}
-	w.Header().Set("Access-Control-Expose-Headers", expose)
+	if status != "" {
+		w.Header().Set("X-Subtitle-Status", status)
+		expose = append(expose, "X-Subtitle-Status")
+	}
+	w.Header().Set("Access-Control-Expose-Headers", strings.Join(expose, ", "))
 	if final {
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 	} else {
@@ -710,8 +721,8 @@ func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total i
 }
 
 // writeVTTLive renders a Snapshot from a live source: Live decides whether
-// X-Subtitle-Live is set, on top of the same done/total/final contract a
-// regular track's snapshot uses.
+// X-Subtitle-Live is set, Status whether X-Subtitle-Status is, on top of
+// the same done/total/final contract a regular track's snapshot uses.
 func writeVTTLive(w http.ResponseWriter, r *http.Request, body []byte, snap *Snapshot) {
-	writeVTT(w, r, body, snap.Done, snap.Total, snap.Final, snap.Live)
+	writeVTT(w, r, body, snap.Done, snap.Total, snap.Final, snap.Live, snap.Status)
 }
