@@ -41,6 +41,14 @@ type Snapshot struct {
 	// offline snapshot, which never sets this). Empty means the header
 	// stays off; only writeVTT decides that.
 	Status string
+	// PendingFrom is the Start of the earliest cue still untranslated among
+	// those ending at or after the live source's current offset (see
+	// pendingFrom in live_job.go) — the movie-time position the viewer will
+	// next hit a translation gap. HasPending is false when there is none: no
+	// such cue exists, this is a final artifact, or this is not a live
+	// snapshot at all. Only LiveSnapshot and LiveProgress set these.
+	PendingFrom time.Duration
+	HasPending  bool
 }
 
 type Runner struct {

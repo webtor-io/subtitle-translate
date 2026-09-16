@@ -518,7 +518,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if found {
-		writeVTT(w, r, body, 100, 100, true, false, "")
+		writeVTT(w, r, body, 100, 100, true, vttMeta{})
 		return
 	}
 	if u, perr := url.Parse(sourceURL); perr == nil && isPlaylistSource(u) {
@@ -577,13 +577,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// source below): it reports what is known without triggering
 			// or waiting on a translation. It also never renders — the body
 			// would be built and dropped on every poll of every viewer.
-			done, total, live, status, err := h.Runner.LiveProgress(ctx, key, src)
+			head, err := h.Runner.LiveProgress(ctx, key, src)
 			if err != nil {
 				logger.WithError(err).Error("live progress failed")
 				http.Error(w, msgUpstreamUnavail, http.StatusBadGateway)
 				return
 			}
-			writeVTT(w, r, nil, done, total, false, live, status)
+			writeVTT(w, r, nil, head.Done, head.Total, false, vttMeta{
+				live:        head.Live,
+				status:      head.Status,
+				hasPending:  head.HasPending,
+				pendingFrom: head.PendingFrom,
+			})
 			return
 		}
 		h.Runner.Ensure(ctx, key, &Job{Lang: lang, SourceLang: ParseSourceLang(r.URL.Query().Get("srclang")), Glossary: ParseNames(r.URL.Query().Get("names")), Live: src})
@@ -620,7 +625,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				done = total
 			}
 		}
-		writeVTT(w, r, nil, done, total, false, false, "")
+		writeVTT(w, r, nil, done, total, false, vttMeta{})
 		return
 	}
 	doc, cerr := h.docFor(ctx, key, sourceURL)
@@ -636,7 +641,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, msgUpstreamUnavail, http.StatusBadGateway)
 		return
 	}
-	writeVTT(w, r, snap.Body, snap.Done, snap.Total, snap.Final, false, "")
+	writeVTT(w, r, snap.Body, snap.Done, snap.Total, snap.Final, vttMeta{})
 }
 
 func (h *Handler) fetchDoc(ctx context.Context, sourceURL string) (*Doc, *clientError) {
@@ -682,30 +687,48 @@ func (h *Handler) fetchDoc(ctx context.Context, sourceURL string) (*Doc, *client
 	return doc, nil
 }
 
-// writeVTT renders a response. live sets X-Subtitle-Live and adds it to the
-// exposed header list; a non-live response keeps the exact header set it
-// had before live sources existed, since it is polled the same way whether
-// or not this build knows about live sources at all.
-//
-// status is independent of live: a live source's job can conclude (Live
-// goes false) while the response is still, and only ever, about that live
-// source — "done" or "stopped" — so it is set whenever status is non-empty,
-// not only while live is true. An offline/file-source call site simply
-// never has a status to pass, so it never appears there. Every caller of
-// this function that is not on the live/playlist path passes "".
-func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total int, final, live bool, status string) {
+// vttMeta is the live-only metadata writeVTT may add on top of the
+// done/total/final contract every response carries. The zero value adds
+// none of it, which is what every non-live call site passes: a non-live
+// response keeps the exact header set it had before live sources existed,
+// since it is polled the same way whether or not this build knows about
+// live sources at all.
+type vttMeta struct {
+	// live sets X-Subtitle-Live.
+	live bool
+	// status is independent of live: a live source's job can conclude
+	// (Live goes false) while the response is still, and only ever, about
+	// that live source — "done" or "stopped" — so it sets X-Subtitle-Status
+	// whenever non-empty, not only while live is true. An offline/file-source
+	// call site simply never has a status to pass, so it stays empty there.
+	status string
+	// hasPending sets X-Subtitle-Pending-From to pendingFrom, formatted as
+	// decimal seconds to 3 places. false leaves the header off: no pending
+	// cue in/after the current run window, a final artifact, or a file
+	// source — see pendingFrom's doc comment for what "pending" means.
+	hasPending  bool
+	pendingFrom time.Duration
+}
+
+// writeVTT renders a response, adding whatever meta carries to the header
+// set every response gets.
+func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total int, final bool, meta vttMeta) {
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	w.Header().Set("X-Subtitle-Progress", strconv.Itoa(done)+"/"+strconv.Itoa(total))
 	// The player polls these headers cross-origin (the proxy adds
 	// Access-Control-Allow-Origin itself and passes these through).
 	expose := []string{"X-Subtitle-Progress"}
-	if live {
+	if meta.live {
 		w.Header().Set("X-Subtitle-Live", "1")
 		expose = append(expose, "X-Subtitle-Live")
 	}
-	if status != "" {
-		w.Header().Set("X-Subtitle-Status", status)
+	if meta.status != "" {
+		w.Header().Set("X-Subtitle-Status", meta.status)
 		expose = append(expose, "X-Subtitle-Status")
+	}
+	if meta.hasPending {
+		w.Header().Set("X-Subtitle-Pending-From", strconv.FormatFloat(meta.pendingFrom.Seconds(), 'f', 3, 64))
+		expose = append(expose, "X-Subtitle-Pending-From")
 	}
 	w.Header().Set("Access-Control-Expose-Headers", strings.Join(expose, ", "))
 	if final {
@@ -721,8 +744,14 @@ func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total i
 }
 
 // writeVTTLive renders a Snapshot from a live source: Live decides whether
-// X-Subtitle-Live is set, Status whether X-Subtitle-Status is, on top of
-// the same done/total/final contract a regular track's snapshot uses.
+// X-Subtitle-Live is set, Status whether X-Subtitle-Status is, HasPending
+// whether X-Subtitle-Pending-From is, on top of the same done/total/final
+// contract a regular track's snapshot uses.
 func writeVTTLive(w http.ResponseWriter, r *http.Request, body []byte, snap *Snapshot) {
-	writeVTT(w, r, body, snap.Done, snap.Total, snap.Final, snap.Live, snap.Status)
+	writeVTT(w, r, body, snap.Done, snap.Total, snap.Final, vttMeta{
+		live:        snap.Live,
+		status:      snap.Status,
+		hasPending:  snap.HasPending,
+		pendingFrom: snap.PendingFrom,
+	})
 }

@@ -452,6 +452,59 @@ func TestHandlerLivePlaylistSource(t *testing.T) {
 	}
 }
 
+// TestHandlerLiveHeadPendingFromHeader: pl1's SESSION-OFFSET is 0 and seg0's
+// only cue starts at 45.107 s untranslated, so a HEAD taken before any
+// translation runs must report that cue's Start as the pending-from header,
+// formatted to 3 decimals, and expose it cross-origin like X-Subtitle-Live.
+func TestHandlerLiveHeadPendingFromHeader(t *testing.T) {
+	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	rec := doLive(h, "HEAD", srv.url())
+	if got := rec.Header().Get("X-Subtitle-Pending-From"); got != "45.107" {
+		t.Fatalf("pending-from: got %q, want %q", got, "45.107")
+	}
+	if !strings.Contains(rec.Header().Get("Access-Control-Expose-Headers"), "X-Subtitle-Pending-From") {
+		t.Fatalf("expose: %q", rec.Header().Get("Access-Control-Expose-Headers"))
+	}
+}
+
+// TestHandlerLiveHeadPendingFromAbsentAfterTranslated: once the only cue the
+// source has offered is translated, there is nothing left for the viewer to
+// meet untranslated, so the header must go away — even though the source is
+// still live (no ENDLIST yet, so this is not the GetFinal shortcut).
+func TestHandlerLiveHeadPendingFromAbsentAfterTranslated(t *testing.T) {
+	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	if rec := doLive(h, "GET", srv.url()); rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	time.Sleep(80 * time.Millisecond)
+	rec := doLive(h, "HEAD", srv.url())
+	if rec.Header().Get("X-Subtitle-Live") != "1" {
+		t.Fatalf("source must still be live: %q", rec.Header().Get("X-Subtitle-Live"))
+	}
+	if got := rec.Header().Get("X-Subtitle-Pending-From"); got != "" {
+		t.Fatalf("pending-from must be absent once every known cue is translated: %q", got)
+	}
+	if strings.Contains(rec.Header().Get("Access-Control-Expose-Headers"), "X-Subtitle-Pending-From") {
+		t.Fatalf("expose must not list pending-from once it is absent: %q", rec.Header().Get("Access-Control-Expose-Headers"))
+	}
+}
+
+// TestHandlerFileSourcePendingFromAbsent: a non-live (file) source has no
+// run window to compare cues against — X-Subtitle-Pending-From is a live
+// source concept and must never appear on this path.
+func TestHandlerFileSourcePendingFromAbsent(t *testing.T) {
+	h, src := newHandlerForTest(t, &fakeTranslator{}, vttWith(2))
+	rec := do(h, "HEAD", "/abc/movie.vtt~tr:pt/movie.vtt", src.URL)
+	if got := rec.Header().Get("X-Subtitle-Pending-From"); got != "" {
+		t.Fatalf("file source must never set pending-from: %q", got)
+	}
+	if strings.Contains(rec.Header().Get("Access-Control-Expose-Headers"), "X-Subtitle-Pending-From") {
+		t.Fatalf("expose must not list pending-from for a file source: %q", rec.Header().Get("Access-Control-Expose-Headers"))
+	}
+}
+
 func TestHandlerLiveKeyIgnoresSessionID(t *testing.T) {
 	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
 	srv.set(pl1+"#EXT-X-ENDLIST\n", map[string]string{"s0-0.vtt": seg0})

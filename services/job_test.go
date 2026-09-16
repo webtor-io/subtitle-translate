@@ -439,6 +439,76 @@ func TestPendingByTimeAheadOfPlayheadWinsAcrossIngestRuns(t *testing.T) {
 	}
 }
 
+// TestPendingFrom pins pendingFrom's filter and selection: the same pending
+// predicate pendingByTime uses (structurally-empty and out-of-range cues
+// never count), restricted to cues at or after the current offset by their
+// End rather than their Start — a cue straddling the playhead is on screen
+// right now and must count, a cue that ended before it must not.
+func TestPendingFrom(t *testing.T) {
+	cue := func(i, sec int, text string) Cue {
+		return Cue{Index: i, Start: time.Duration(sec) * time.Second, End: time.Duration(sec+1) * time.Second, Lines: []string{text}}
+	}
+
+	t.Run("earliest of several pending cues ahead, one translated between them", func(t *testing.T) {
+		doc := &Doc{Cues: []Cue{
+			cue(0, 100, "a"),
+			cue(1, 150, "b"),
+			cue(2, 200, "c"),
+		}}
+		lines := []string{"", "PT:b", ""}
+		from, ok := pendingFrom(doc, lines, 0)
+		if !ok || from != 100*time.Second {
+			t.Fatalf("from=%s ok=%v, want 100s/true", from, ok)
+		}
+	})
+
+	t.Run("a cue entirely before current is ignored, a straddling cue counts", func(t *testing.T) {
+		doc := &Doc{Cues: []Cue{
+			// End (11s) < current (50s): the viewer already passed it.
+			{Index: 0, Start: 10 * time.Second, End: 11 * time.Second, Lines: []string{"before"}},
+			// Start (45s) < current (50s) <= End (55s): on screen right now.
+			{Index: 1, Start: 45 * time.Second, End: 55 * time.Second, Lines: []string{"straddle"}},
+		}}
+		lines := []string{"", ""}
+		from, ok := pendingFrom(doc, lines, 50*time.Second)
+		if !ok || from != 45*time.Second {
+			t.Fatalf("from=%s ok=%v, want 45s/true (the passed-by cue must not win)", from, ok)
+		}
+	})
+
+	t.Run("all translated: ok is false", func(t *testing.T) {
+		doc := &Doc{Cues: []Cue{cue(0, 10, "a"), cue(1, 20, "b")}}
+		lines := []string{"PT:a", "PT:b"}
+		if _, ok := pendingFrom(doc, lines, 0); ok {
+			t.Fatal("everything translated: ok must be false")
+		}
+	})
+
+	t.Run("a structurally empty cue is never pending", func(t *testing.T) {
+		doc := &Doc{Cues: []Cue{
+			{Index: 0, Start: 0, End: 1 * time.Second, Lines: nil},
+			cue(1, 100, "b"),
+		}}
+		lines := []string{"", ""}
+		from, ok := pendingFrom(doc, lines, 0)
+		if !ok || from != 100*time.Second {
+			t.Fatalf("from=%s ok=%v, want 100s/true (the empty-lines cue must not count)", from, ok)
+		}
+	})
+
+	t.Run("lines shorter than the cue index: that cue is not pending", func(t *testing.T) {
+		doc := &Doc{Cues: []Cue{
+			cue(0, 100, "a"),
+			{Index: 5, Start: 10 * time.Second, End: 11 * time.Second, Lines: []string{"out of range"}},
+		}}
+		lines := []string{""} // len 1: index 0 is in range, index 5 is not
+		from, ok := pendingFrom(doc, lines, 0)
+		if !ok || from != 100*time.Second {
+			t.Fatalf("from=%s ok=%v, want 100s/true (the out-of-range cue must not count)", from, ok)
+		}
+	})
+}
+
 // TestLiveRunnerTranslatesAheadOfPlayheadFirstAfterSeek is the runner-level
 // reproduction of the reported bug: after a seek, hundreds of untranslated
 // cues can be left behind by the abandoned run, and ordering pending work by
@@ -838,12 +908,15 @@ func TestLiveProgressMatchesSnapshotWithoutABody(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		done, total, live, status, err := r.LiveProgress(context.Background(), "k", ls)
+		head, err := r.LiveProgress(context.Background(), "k", ls)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if done != snap.Done || total != snap.Total || live != snap.Live || status != snap.Status {
-			t.Fatalf("%s: progress=%d/%d live=%v status=%q, snapshot=%d/%d live=%v status=%q", what, done, total, live, status, snap.Done, snap.Total, snap.Live, snap.Status)
+		if head.Done != snap.Done || head.Total != snap.Total || head.Live != snap.Live || head.Status != snap.Status ||
+			head.HasPending != snap.HasPending || head.PendingFrom != snap.PendingFrom {
+			t.Fatalf("%s: progress=%d/%d live=%v status=%q pending=%v/%s, snapshot=%d/%d live=%v status=%q pending=%v/%s",
+				what, head.Done, head.Total, head.Live, head.Status, head.HasPending, head.PendingFrom,
+				snap.Done, snap.Total, snap.Live, snap.Status, snap.HasPending, snap.PendingFrom)
 		}
 	}
 

@@ -112,12 +112,15 @@ func (r *Runner) LiveSnapshot(ctx context.Context, key string, src *LiveSource) 
 	if p != nil {
 		status = p.Status
 	}
+	from, hasPending := pendingFrom(doc, lines, src.CurrentOffset())
 	return &Snapshot{
-		Body:   body,
-		Done:   countDoneByIndex(lines, doc),
-		Total:  len(doc.Cues),
-		Live:   p == nil || p.Live,
-		Status: status,
+		Body:        body,
+		Done:        countDoneByIndex(lines, doc),
+		Total:       len(doc.Cues),
+		Live:        p == nil || p.Live,
+		Status:      status,
+		PendingFrom: from,
+		HasPending:  hasPending,
 	}, nil
 }
 
@@ -308,6 +311,34 @@ func pendingByTime(doc *Doc, lines []string, current time.Duration) ([]int, []st
 		}
 	}
 	return append(aheadIdx, behindIdx...), append(aheadTexts, behindTexts...)
+}
+
+// pendingFrom reports the start of the earliest untranslated cue the viewer
+// can still meet in the current run: same pending filter as pendingByTime,
+// restricted to cues ending at or after the source's current offset. ok is
+// false when there is none.
+//
+// End >= current rather than Start >= current: a cue straddling the
+// playhead (Start < current <= End) is what is on screen right now, and a
+// viewer who seeks into it must still see it counted. Cues that ended
+// before current are behind the playhead — the viewer already passed
+// them — and are left out so a job that went ahead-first (pendingByTime)
+// does not keep the "translation is behind" banner up for a passage the
+// viewer already left.
+func pendingFrom(doc *Doc, lines []string, current time.Duration) (from time.Duration, ok bool) {
+	for _, c := range doc.Cues {
+		if len(c.Lines) == 0 || c.Index < 0 || c.Index >= len(lines) || lines[c.Index] != "" {
+			continue
+		}
+		if c.End < current {
+			continue
+		}
+		if !ok || c.Start < from {
+			from = c.Start
+			ok = true
+		}
+	}
+	return from, ok
 }
 
 // runLive translates a playlist that is still being written. It holds the
@@ -569,21 +600,33 @@ func (r *Runner) putProgress(ctx context.Context, key string, logger *log.Entry,
 // (see LiveSource.RefreshIfStale).
 func (r *Runner) LivePollInterval() time.Duration { return r.live.PollInterval }
 
+// LiveHead is what LiveProgress reports: the counts and flags HEAD needs,
+// without the body LiveSnapshot renders alongside them.
+type LiveHead struct {
+	Done, Total int
+	Live        bool
+	Status      string
+	// PendingFrom and HasPending carry the same X-Subtitle-Pending-From
+	// contract as Snapshot: see its doc comment.
+	PendingFrom time.Duration
+	HasPending  bool
+}
+
 // LiveProgress is LiveSnapshot without the body: the same alignment, the
 // same counts, no render. HEAD asks for exactly this, and rendering a whole
 // document into a response that discards it is the most expensive thing a
 // live key does per poll.
-func (r *Runner) LiveProgress(ctx context.Context, key string, src *LiveSource) (done, total int, live bool, status string, err error) {
+func (r *Runner) LiveProgress(ctx context.Context, key string, src *LiveSource) (LiveHead, error) {
 	if _, ok, err := r.store.GetFinal(ctx, key); err != nil {
-		return 0, 0, false, "", err
+		return LiveHead{}, err
 	} else if ok {
 		// Same convention as LiveSnapshot: a finished artifact has no cue
 		// count to report, and done == total reads as complete.
-		return 100, 100, false, "", nil
+		return LiveHead{Done: 100, Total: 100}, nil
 	}
 	p, err := r.store.GetProgress(ctx, key)
 	if err != nil {
-		return 0, 0, false, "", err
+		return LiveHead{}, err
 	}
 	doc := src.Doc().Snapshot()
 	lines := alignLines(p, doc)
@@ -591,5 +634,13 @@ func (r *Runner) LiveProgress(ctx context.Context, key string, src *LiveSource) 
 	if p != nil {
 		st = p.Status
 	}
-	return countDoneByIndex(lines, doc), len(doc.Cues), p == nil || p.Live, st, nil
+	from, hasPending := pendingFrom(doc, lines, src.CurrentOffset())
+	return LiveHead{
+		Done:        countDoneByIndex(lines, doc),
+		Total:       len(doc.Cues),
+		Live:        p == nil || p.Live,
+		Status:      st,
+		PendingFrom: from,
+		HasPending:  hasPending,
+	}, nil
 }

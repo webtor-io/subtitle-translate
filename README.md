@@ -52,6 +52,14 @@ Response headers:
     as before this header existed.
   - A later transcoder session on the same key is new work and starts
     without this header, even if the previous session ended `done`.
+- `X-Subtitle-Pending-From: <seconds>` — set only when `X-Source-Url` is a
+  live HLS subtitle playlist and a cue the viewer can still meet is
+  untranslated: decimal movie-time seconds (3 decimals, e.g. `612.480`) of
+  the `Start` of the earliest such cue. See [Live HLS source](#live-hls-source)
+  for exactly which cues count.
+  - Absent when there is no such cue: everything at or ahead of the current
+    position is translated, the response is a finished/final artifact, or
+    `X-Source-Url` is not a live playlist at all.
 
 Status codes:
 
@@ -107,6 +115,18 @@ a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
   for the session (kept in Redis for 24 h under the same key, reused by cue
   identity on the next session); the next contiguous viewing completes it.
 - After a seek, cues at or after the current position are translated before the backlog behind it.
+- `X-Subtitle-Pending-From` tells a poller whether the *next* cue the viewer
+  will actually reach is translated yet — something the done/total counts
+  cannot answer, since in live mode there is almost always an untranslated
+  backlog behind the transcoder's newest segment, and after a seek the
+  untranslated cues may lie behind the playhead (irrelevant) or ahead of it
+  (what matters). It is the `Start` of the earliest untranslated cue among
+  those whose `End` is at or after the current `#EXT-X-SESSION-OFFSET`, i.e.
+  cues already fully behind the playhead are excluded — a job that went
+  ahead-first (see above) leaves them pending for a long time, and reporting
+  them would keep a "translation is behind" banner up for a passage the
+  viewer already left, while a cue straddling the playhead (still on screen)
+  is included.
 - The job stops on its own when nobody polled the key for `--live-idle`:
   reading the playlist keeps the transcoder session alive, so an unwatched
   translation would otherwise transcode the whole file for nobody. It also stops
