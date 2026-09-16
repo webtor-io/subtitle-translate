@@ -50,7 +50,11 @@ type Runner struct {
 	cancel context.CancelFunc
 	// sem bounds how many jobs translate at once: each job holds an upstream
 	// connection and a whole parsed document for its lifetime.
-	sem     chan struct{}
+	sem chan struct{}
+	// liveSem is sem's counterpart for live jobs, sized by LiveConfig
+	// (see SetLive): the two kinds of job hold a slot for wildly different
+	// lengths of time, and one film must not queue every later track.
+	liveSem chan struct{}
 	wg      sync.WaitGroup
 	mu      sync.Mutex
 	closed  bool
@@ -171,12 +175,16 @@ func (r *Runner) Ensure(_ context.Context, key string, job *Job) {
 		// The key is registered before the slot is taken, so a burst of
 		// requests for the same track still collapses into one job; what
 		// waits here is the work, not the deduplication.
+		sem := r.sem
+		if job.Live != nil {
+			sem = r.liveSem
+		}
 		select {
-		case r.sem <- struct{}{}:
+		case sem <- struct{}{}:
 		case <-r.ctx.Done():
 			return
 		}
-		defer func() { <-r.sem }()
+		defer func() { <-sem }()
 		JobsRunning.Inc()
 		defer JobsRunning.Dec()
 		// The background job outlives the request that triggered it, so it

@@ -587,3 +587,141 @@ func TestLiveRunnerIdlesOutWithoutATouch(t *testing.T) {
 		t.Fatal("a job nobody touched must still stop after the idle window")
 	}
 }
+
+// TestRunnerLiveJobsDoNotWaitOnTheOfflineSemaphore: an offline job holds
+// its slot for seconds, a live one for the length of a film. Sharing one
+// semaphore means the (default: 4) first live translations park every later
+// key behind a whole movie, and its viewer is told "0/N, live" — the same
+// thing a job that is merely starting up says — for an hour.
+func TestRunnerLiveJobsDoNotWaitOnTheOfflineSemaphore(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	doc, _ := ParseVTT(strings.NewReader(vttWith(3)))
+	doc.Normalize()
+	ft := &fakeTranslator{block: make(chan struct{})}
+	release := releaser(ft.block)
+	st := NewMemoryStore()
+	r := NewRunner(st, ft, 3, 1, time.Minute) // one offline slot, taken below
+	r.SetLive(LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute})
+	defer func() { release(); r.Close() }()
+
+	r.Ensure(context.Background(), "offline", &Job{Lang: "pt", Doc: doc})
+	waitForCalls(t, ft, 1) // the offline job holds the only offline slot
+
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("live")
+	r.Ensure(context.Background(), "live", &Job{Lang: "pt", Live: ls})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if p, _ := st.GetProgress(context.Background(), "live"); p != nil && p.Total > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the live job never ran: it is queued behind the offline semaphore")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestLiveProgressMatchesSnapshotWithoutABody: HEAD asks for the counts,
+// not the track. LiveSnapshot renders the whole document (a sort plus a
+// WebVTT serialization of every cue) before the handler drops the body, on
+// every HEAD of every viewer — so the HEAD path reads LiveProgress, which
+// must agree with LiveSnapshot cue for cue.
+func TestLiveProgressMatchesSnapshotWithoutABody(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl2, map[string]string{"s0-0.vtt": seg0, "s0-1.vtt": seg1})
+	r, st := newLiveRunner(t, &fakeTranslator{}, 50, LiveConfig{PollInterval: time.Hour, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	keys := ls.Doc().Keys()
+
+	check := func(what string) {
+		t.Helper()
+		snap, err := r.LiveSnapshot(context.Background(), "k", ls)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done, total, live, err := r.LiveProgress(context.Background(), "k", ls)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if done != snap.Done || total != snap.Total || live != snap.Live {
+			t.Fatalf("%s: progress=%d/%d live=%v, snapshot=%d/%d live=%v", what, done, total, live, snap.Done, snap.Total, snap.Live)
+		}
+	}
+
+	check("no record yet")
+
+	// One cue translated, stored under its own key but at another index:
+	// the counts have to come from the same alignment the body does.
+	p := &Progress{Total: 2, Live: true, CueKeys: []string{keys[1], keys[0]}, Lines: []string{"PT:Привет.", ""}}
+	if err := st.PutProgress(context.Background(), "k", p); err != nil {
+		t.Fatal(err)
+	}
+	check("one cue aligned by key")
+
+	p.Live = false
+	if err := st.PutProgress(context.Background(), "k", p); err != nil {
+		t.Fatal(err)
+	}
+	check("job stopped")
+
+	if err := st.PutFinal(context.Background(), "k", []byte("WEBVTT\n")); err != nil {
+		t.Fatal(err)
+	}
+	check("final artifact")
+}
+
+// TestLiveRunnerReusesTranslationsAcrossRunShift: the other half of the
+// tolerant cue identity. A session's stored translations carry the cue keys
+// of the run that produced them; the next run's timeline is shifted by up
+// to one GOP (measured: 1.657 s), so exact-key reuse misses every one of
+// them and the whole film is paid for again.
+func TestLiveRunnerReusesTranslationsAcrossRunShift(t *testing.T) {
+	const ms = time.Millisecond
+	srv := newLivePlaylistServer(t)
+	segA := "WEBVTT\n\n00:00.000 --> 00:02.628\nЯ такой.\n\n00:02.628 --> 00:04.588\nСтой.\n"
+	plA := "#EXTM3U\n#EXT-X-SESSION-OFFSET:600\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-TARGETDURATION:5\n#EXTINF:4.588,\ns0-0.vtt?token=T\n"
+	srv.set(plA, map[string]string{"s0-0.vtt": segA})
+	tr := &fakeTranslator{}
+	r, st := newLiveRunner(t, tr, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: 20 * time.Millisecond, Idle: time.Minute})
+
+	// What the previous session stored, on its own run's timeline (+1.657 s).
+	p := &Progress{
+		Total: 2,
+		Live:  true,
+		CueKeys: []string{
+			CueKey(601657*ms, 604285*ms, []string{"Я такой."}),
+			CueKey(604285*ms, 606245*ms, []string{"Стой."}),
+		},
+		Lines: []string{"PT:Я такой.", "PT:Стой."},
+	}
+	if err := st.PutProgress(context.Background(), "k", p); err != nil {
+		t.Fatal(err)
+	}
+
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got, _ := st.GetProgress(context.Background(), "k")
+		if got != nil && got.Total == 2 && countFilled(got.Lines) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the job never picked the document up: %+v", got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Past BatchWait: if the stored lines had not been reused, the pending
+	// cues would have gone upstream by now.
+	time.Sleep(60 * time.Millisecond)
+	if n := atomic.LoadInt32(&tr.calls); n != 0 {
+		t.Fatalf("translated %d batch(es) that were already paid for on the previous run", n)
+	}
+}

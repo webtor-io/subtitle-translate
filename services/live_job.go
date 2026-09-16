@@ -2,6 +2,8 @@ package services
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -10,10 +12,20 @@ import (
 
 // LiveConfig tunes the live loop: how often the playlist is re-read, how
 // long a lone pending cue waits for company before it is translated alone,
-// and how long the job keeps going after the last request for its key.
-type LiveConfig struct{ PollInterval, BatchWait, Idle time.Duration }
+// how long the job keeps going after the last request for its key, and how
+// many live jobs may run at once.
+type LiveConfig struct {
+	PollInterval, BatchWait, Idle time.Duration
+	// MaxJobs bounds live jobs separately from offline ones. A live job
+	// holds its slot for the length of a film while doing almost nothing —
+	// it waits on a playlist and on the upstream — so the offline bound,
+	// sized for jobs that finish in seconds and hold a whole parsed
+	// document, is the wrong number for it.
+	MaxJobs int
+}
 
 // SetLive replaces the live loop's timings. A zero field keeps the default.
+// Call it before the first job starts: it rebuilds the live semaphore.
 func (r *Runner) SetLive(cfg LiveConfig) {
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 4 * time.Second
@@ -24,7 +36,11 @@ func (r *Runner) SetLive(cfg LiveConfig) {
 	if cfg.Idle <= 0 {
 		cfg.Idle = 90 * time.Second
 	}
+	if cfg.MaxJobs < 1 {
+		cfg.MaxJobs = 16
+	}
 	r.live = cfg
+	r.liveSem = make(chan struct{}, cfg.MaxJobs)
 }
 
 // Touch records that someone asked for key just now. The live loop stops
@@ -113,10 +129,62 @@ func countDoneByIndex(lines []string, doc *Doc) int {
 	return n
 }
 
-// knownLines is every translation a progress record carries, keyed by the
-// identity of the cue it belongs to.
-func knownLines(p *Progress) map[string]string {
-	known := map[string]string{}
+// knownCue is one stored translation with the cue identity it was filed
+// under, taken apart so it can also be matched tolerantly.
+type knownCue struct {
+	start, end time.Duration
+	line       string
+}
+
+// knownLines is every translation a progress record carries, indexed both
+// by the exact cue key it was stored under and by cue text, so a run whose
+// timeline is shifted (see cueMatchTolerance) still finds it.
+type knownLines struct {
+	exact  map[string]string
+	byText map[string][]knownCue
+}
+
+// lookup returns the translation stored for this cue: the exact key first,
+// then the same text within the tolerance window. Without the second step a
+// seek re-pays for every cue of the replayed range, because the transcoder
+// starts each run at its own keyframe and no key matches across runs.
+func (k knownLines) lookup(start, end time.Duration, lines []string) string {
+	if l, ok := k.exact[CueKey(start, end, lines)]; ok {
+		return l
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	for _, c := range k.byText[cueText(lines)] {
+		if sameCue(c.start, c.end, start, end) {
+			return c.line
+		}
+	}
+	return ""
+}
+
+func (k knownLines) empty() bool { return len(k.exact) == 0 }
+
+// parseCueKey takes a stored key back apart into the cue it describes.
+func parseCueKey(k string) (start, end time.Duration, text string, ok bool) {
+	parts := strings.SplitN(k, "|", 3)
+	if len(parts) != 3 {
+		return 0, 0, "", false
+	}
+	s, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, "", false
+	}
+	e, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, "", false
+	}
+	return time.Duration(s) * time.Millisecond, time.Duration(e) * time.Millisecond, parts[2], true
+}
+
+// collectKnown indexes every translation a progress record carries.
+func collectKnown(p *Progress) knownLines {
+	known := knownLines{exact: map[string]string{}, byText: map[string][]knownCue{}}
 	if p == nil {
 		return known
 	}
@@ -124,28 +192,33 @@ func knownLines(p *Progress) map[string]string {
 		if k == "" || i >= len(p.Lines) || p.Lines[i] == "" {
 			continue
 		}
-		known[k] = p.Lines[i]
+		known.exact[k] = p.Lines[i]
+		if start, end, text, ok := parseCueKey(k); ok && text != "" {
+			known.byText[text] = append(known.byText[text], knownCue{start: start, end: end, line: p.Lines[i]})
+		}
 	}
 	return known
 }
 
 // alignLines projects the translations p carries onto doc's own cue
 // indexes, which is what RenderByIndex and Progress.Lines are indexed by.
-// A cue whose key p does not know comes back empty: the alternative is
-// showing one cue's text under another, which is what positional reuse
-// does the moment a seek renumbers the document. Pure: no reader of it
+// A cue p does not know comes back empty: the alternative is showing one
+// cue's text under another, which is what positional reuse does the moment
+// a seek renumbers the document. Matching is by cue identity — exact key
+// first, then the same text within cueMatchTolerance, since each run of the
+// transcoder has its own keyframe-aligned timeline. Pure: no reader of it
 // needs to have run the job.
 func alignLines(p *Progress, doc *Doc) []string {
 	out := make([]string, len(doc.Cues))
-	known := knownLines(p)
-	if len(known) == 0 {
+	known := collectKnown(p)
+	if known.empty() {
 		return out
 	}
 	for _, c := range doc.Cues {
 		if c.Index < 0 || c.Index >= len(out) {
 			continue
 		}
-		out[c.Index] = known[CueKey(c.Start, c.End, c.Lines)]
+		out[c.Index] = known.lookup(c.Start, c.End, c.Lines)
 	}
 	return out
 }
@@ -246,15 +319,7 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 			// must not skip the lease refresh or the viewer-gone check: both
 			// have to run every tick, not only on a tick that got a fresh
 			// document.
-			if !r.holdLock(ctx, key, token, logger, &lockedAt) {
-				return
-			}
-			if r.sinceSeen(key) > r.live.Idle {
-				logger.Info("viewer gone, stopping")
-				JobErrors.WithLabelValues("viewer_gone").Inc()
-				// Live stays set: the source has not ended, the translation is
-				// only paused until someone asks for this track again.
-				r.putProgress(ctx, key, logger, p)
+			if !r.keepAlive(ctx, key, token, logger, &lockedAt, p) {
 				return
 			}
 			continue
@@ -309,25 +374,39 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 				}
 				published = p.Total
 			}
-			// Ticks are seconds and the lease is minutes, so the lock is
-			// refreshed on its own schedule instead of once per tick.
-			if !r.holdLock(ctx, key, token, logger, &lockedAt) {
-				return
-			}
 		}
 		if ref.Ended && pending == 0 {
+			// A playlist that ended with everything translated is finished
+			// work; it is written before the lease is looked at again, so a
+			// viewer who walked away on the last tick still gets the
+			// artifact their session paid for.
 			r.finishLive(ctx, key, logger, job, p, doc, start)
 			return
 		}
-		if r.sinceSeen(key) > r.live.Idle {
-			logger.Info("viewer gone, stopping")
-			JobErrors.WithLabelValues("viewer_gone").Inc()
-			// Live stays set: the source has not ended, the translation is
-			// only paused until someone asks for this track again.
-			r.putProgress(ctx, key, logger, p)
+		if !r.keepAlive(ctx, key, token, logger, &lockedAt, p) {
 			return
 		}
 	}
+}
+
+// keepAlive is the end of every tick, whether or not it got a document:
+// refresh the lease (on its own schedule — ticks are seconds and the lease
+// is minutes, so this is usually a no-op, and always one right after a
+// batch, which refreshes the lease itself) and stop when nobody has asked
+// for the key for --live-idle. It reports whether the job may keep going.
+func (r *Runner) keepAlive(ctx context.Context, key, token string, logger *log.Entry, lockedAt *time.Time, p *Progress) bool {
+	if !r.holdLock(ctx, key, token, logger, lockedAt) {
+		return false
+	}
+	if r.sinceSeen(key) > r.live.Idle {
+		logger.Info("viewer gone, stopping")
+		JobErrors.WithLabelValues("viewer_gone").Inc()
+		// Live stays set: the source has not ended, the translation is only
+		// paused until someone asks for this track again.
+		r.putProgress(ctx, key, logger, p)
+		return false
+	}
+	return true
 }
 
 // pollLive reads the playlist once, under a deadline of its own. Refresh
@@ -403,4 +482,30 @@ func (r *Runner) putProgress(ctx context.Context, key string, logger *log.Entry,
 		JobErrors.WithLabelValues("store").Inc()
 		logger.WithError(err).Error("failed to store progress")
 	}
+}
+
+// LivePollInterval is how often the live loop re-reads a playlist. The
+// handler reads it too: it is the staleness bound for the source it serves
+// (see LiveSource.RefreshIfStale).
+func (r *Runner) LivePollInterval() time.Duration { return r.live.PollInterval }
+
+// LiveProgress is LiveSnapshot without the body: the same alignment, the
+// same counts, no render. HEAD asks for exactly this, and rendering a whole
+// document into a response that discards it is the most expensive thing a
+// live key does per poll.
+func (r *Runner) LiveProgress(ctx context.Context, key string, src *LiveSource) (done, total int, live bool, err error) {
+	if _, ok, err := r.store.GetFinal(ctx, key); err != nil {
+		return 0, 0, false, err
+	} else if ok {
+		// Same convention as LiveSnapshot: a finished artifact has no cue
+		// count to report, and done == total reads as complete.
+		return 100, 100, false, nil
+	}
+	p, err := r.store.GetProgress(ctx, key)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	doc := src.Doc().Snapshot()
+	lines := alignLines(p, doc)
+	return countDoneByIndex(lines, doc), len(doc.Cues), p == nil || p.Live, nil
 }

@@ -40,6 +40,16 @@ type LiveSource struct {
 	ended      bool
 	contiguous bool
 	retired    bool
+	// gone records that the playlist itself answered 404/503 — the session
+	// is over as far as the transcoder is concerned. Retire does not set it:
+	// a source this process replaced in its cache is not evidence about the
+	// session, only about our own bookkeeping.
+	gone bool
+	// lastRefresh is when Refresh last completed successfully. It is what
+	// RefreshIfStale reads, so a replica that does not own the job can keep
+	// the source it serves growing without doubling the poll rate of the
+	// one that does.
+	lastRefresh time.Time
 }
 
 func NewLiveSource(playlistURL string, client *http.Client, maxBytes int64, maxCues int) *LiveSource {
@@ -58,6 +68,17 @@ func (s *LiveSource) Contiguous() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.contiguous
+}
+
+// Gone reports whether the playlist answered 404/503: the transcoder
+// session this source follows is over. Distinct from Retire, which is this
+// process deciding to stop using a source that may well still be alive —
+// the handler tells the two apart when it has to choose between a source
+// it retired and the one it is serving now.
+func (s *LiveSource) Gone() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gone
 }
 
 // Retire marks the source as gone for good, without touching the network:
@@ -86,14 +107,13 @@ func (s *LiveSource) get(ctx context.Context, u string) ([]byte, error) {
 		return nil, err
 	}
 	defer res.Body.Close()
-	switch res.StatusCode {
-	case http.StatusOK:
-	case http.StatusNotFound, http.StatusServiceUnavailable:
-		// 404: the session is gone (viewer left). 503: the transcoder hit
-		// its restart budget for this session. Neither comes back.
-		return nil, errors.Wrapf(ErrSourceGone, "status %d", res.StatusCode)
-	default:
-		return nil, errors.Errorf("source returned %d", res.StatusCode)
+	if res.StatusCode != http.StatusOK {
+		// The status is carried, not interpreted: only the playlist's
+		// 404/503 means the session is over (see Refresh). A segment's is a
+		// hiccup of whatever sits in between — torrent-http-proxy answers
+		// 503 under load and while rate-limiting — and the next tick asks
+		// for it again.
+		return nil, &sourceStatusError{status: res.StatusCode}
 	}
 	data, err := io.ReadAll(io.LimitReader(res.Body, s.maxBytes+1))
 	if err != nil {
@@ -105,14 +125,57 @@ func (s *LiveSource) get(ctx context.Context, u string) ([]byte, error) {
 	return data, nil
 }
 
+// sourceStatusError is a non-200 from the transcoder, carrying the status
+// so the caller can decide what it means for the URL it asked for.
+type sourceStatusError struct{ status int }
+
+func (e *sourceStatusError) Error() string { return fmt.Sprintf("source returned %d", e.status) }
+
+// endsSession reports whether a status on the playlist means the transcoder
+// session is over for good. 404: the session was reaped (viewer left).
+// 503: the transcoder hit its restart budget for this session.
+func endsSession(err error) (int, bool) {
+	var se *sourceStatusError
+	if !errors.As(err, &se) {
+		return 0, false
+	}
+	return se.status, se.status == http.StatusNotFound || se.status == http.StatusServiceUnavailable
+}
+
 // Refresh reads the playlist once and fetches every segment not seen
 // before (in playlist order). It returns ErrSourceGone on a 404/503 for
 // the playlist or when Retire was called, ErrSourceTooLarge past the caps;
-// other fetch errors are returned as-is (transient: the caller retries
-// next tick).
+// other fetch errors — a segment's 404/503 included — are returned as-is
+// (transient: the caller retries next tick, and the segment is not in seen,
+// so nothing is lost).
 func (s *LiveSource) Refresh(ctx context.Context) (Refresh, error) {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
+	return s.refresh(ctx)
+}
+
+// RefreshIfStale runs Refresh only when the last successful one is older
+// than maxAge (or there has not been one). It exists for the handler: the
+// job refreshes on its own ticker, but only on the replica that won the
+// store lock, and every other replica serves a document that nothing else
+// would ever advance. Calling this on every poll costs at most one playlist
+// read per maxAge per key per replica, and is a no-op on the replica whose
+// loop has just refreshed the same object.
+func (s *LiveSource) RefreshIfStale(ctx context.Context, maxAge time.Duration) (Refresh, error) {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	s.mu.Lock()
+	last := s.lastRefresh
+	ended := s.ended
+	s.mu.Unlock()
+	if !last.IsZero() && time.Since(last) < maxAge {
+		return Refresh{Ended: ended}, nil
+	}
+	return s.refresh(ctx)
+}
+
+// refresh is Refresh with the refresh lock already held.
+func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 	s.mu.Lock()
 	retired := s.retired
 	s.mu.Unlock()
@@ -121,6 +184,12 @@ func (s *LiveSource) Refresh(ctx context.Context) (Refresh, error) {
 	}
 	data, err := s.get(ctx, s.url)
 	if err != nil {
+		if status, ends := endsSession(err); ends {
+			s.mu.Lock()
+			s.gone = true
+			s.mu.Unlock()
+			return Refresh{}, errors.Wrapf(ErrSourceGone, "status %d", status)
+		}
 		return Refresh{}, err
 	}
 	pl, err := ParseMediaPlaylist(s.url, data)
@@ -163,6 +232,7 @@ func (s *LiveSource) Refresh(ctx context.Context) (Refresh, error) {
 		s.ended = true
 	}
 	out.Ended = s.ended
+	s.lastRefresh = time.Now()
 	s.mu.Unlock()
 	return out, nil
 }

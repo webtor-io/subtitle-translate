@@ -20,6 +20,7 @@ const (
 	flagLivePollInterval = "live-poll-interval"
 	flagLiveBatchWait    = "live-batch-wait"
 	flagLiveIdle         = "live-idle"
+	flagLiveMaxJobs      = "live-max-jobs"
 )
 
 func configure(app *cli.App) {
@@ -40,6 +41,7 @@ func configure(app *cli.App) {
 		cli.IntFlag{Name: flagLivePollInterval, Usage: "how often a live HLS subtitle playlist is re-read, seconds", Value: 4, EnvVar: "SUBTITLE_TRANSLATE_LIVE_POLL_INTERVAL"},
 		cli.IntFlag{Name: flagLiveBatchWait, Usage: "longest a pending live cue waits before a batch smaller than --batch-size is sent, seconds", Value: 10, EnvVar: "SUBTITLE_TRANSLATE_LIVE_BATCH_WAIT"},
 		cli.IntFlag{Name: flagLiveIdle, Usage: "a live job stops when nobody polled its key for this long, seconds", Value: 90, EnvVar: "SUBTITLE_TRANSLATE_LIVE_IDLE"},
+		cli.IntFlag{Name: flagLiveMaxJobs, Usage: "live translation jobs running at once in this replica, bounded separately from --max-jobs", Value: 16, EnvVar: "SUBTITLE_TRANSLATE_LIVE_MAX_JOBS"},
 	)
 	app.Action = run
 }
@@ -66,6 +68,7 @@ func run(c *cli.Context) error {
 			PollInterval: time.Duration(c.Int(flagLivePollInterval)) * time.Second,
 			BatchWait:    time.Duration(c.Int(flagLiveBatchWait)) * time.Second,
 			Idle:         time.Duration(c.Int(flagLiveIdle)) * time.Second,
+			MaxJobs:      c.Int(flagLiveMaxJobs),
 		})
 		// Deferred before the web server, so it runs after it: requests stop
 		// first, then the running jobs are canceled and drained, and only

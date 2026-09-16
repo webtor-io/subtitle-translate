@@ -89,3 +89,44 @@ func TestRenderByIndexSkipsUntranslated(t *testing.T) {
 		t.Fatalf("translated cue missing:\n%s", body)
 	}
 }
+
+// Measured on the stand (2026-09-16, same MKV, two sessions): seek 600 →
+// run A, seek 570 → run B. The same line lands at A 600.000 / B 601.657,
+// A 602.628 / B 604.285, A 604.588 / B 606.245 — a constant 1.657 s between
+// runs, and A's first cue clipped to 00:00.000. The transcoder reports the
+// requested, 30 s-quantized seek as #EXT-X-SESSION-OFFSET but starts FFmpeg
+// at the keyframe at or before it (input -ss with -noaccurate_seek), so
+// cue + offset is short by up to one GOP (48 frames ≈ 2 s at 24 fps) per
+// run. Exact-millisecond identity therefore misses across runs, and the
+// same cue is translated and rendered twice.
+func TestLiveDocDedupsTheSameCueAcrossRunShift(t *testing.T) {
+	const runA = "WEBVTT\n\n00:00.000 --> 00:02.628\nЯ такой.\n"  // clipped first cue of the seek-600 run
+	const runB = "WEBVTT\n\n00:31.657 --> 00:34.285\nЯ такой.\n"  // same line in the seek-570 run
+	const later = "WEBVTT\n\n00:10.000 --> 00:12.000\nЯ такой.\n" // the line genuinely said again
+	d := NewLiveDoc()
+	if n, err := d.AddSegment(600*time.Second, []byte(runA)); err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if n, _ := d.AddSegment(570*time.Second, []byte(runB)); n != 0 || d.Len() != 1 {
+		t.Fatalf("a 1.657 s run shift is the same cue: n=%d len=%d", n, d.Len())
+	}
+	if n, _ := d.AddSegment(600*time.Second, []byte(later)); n != 1 || d.Len() != 2 {
+		t.Fatalf("the same line 10 s later is a different cue: n=%d len=%d", n, d.Len())
+	}
+}
+
+// A cue that straddles the seek point is clipped to the run's start, so its
+// start carries the whole clip while its end keeps the run shift. Matching
+// on start alone misses it; the end is what identifies it.
+func TestLiveDocDedupsAClippedCueByItsEnd(t *testing.T) {
+	const unclipped = "WEBVTT\n\n00:26.657 --> 00:36.245\nСтой.\n" // run B (offset 570): 596.657 → 606.245
+	const clipped = "WEBVTT\n\n00:00.000 --> 00:04.588\nСтой.\n"   // run A (offset 600): 600.000 → 604.588
+	d := NewLiveDoc()
+	if n, err := d.AddSegment(570*time.Second, []byte(unclipped)); err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	// |Δstart| = 3.343 s is outside the window; |Δend| = 1.657 s is inside.
+	if n, _ := d.AddSegment(600*time.Second, []byte(clipped)); n != 0 || d.Len() != 1 {
+		t.Fatalf("a clipped twin is the same cue: n=%d len=%d", n, d.Len())
+	}
+}

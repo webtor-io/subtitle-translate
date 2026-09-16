@@ -12,20 +12,63 @@ import (
 	"github.com/pkg/errors"
 )
 
+// cueMatchTolerance is how far apart in movie time two cues with the same
+// text may sit and still be the same cue.
+//
+// The transcoder reports the requested, 30 s-quantized seek as
+// #EXT-X-SESSION-OFFSET, but invokes FFmpeg with input-level -ss plus
+// -noaccurate_seek in copy mode, so the run actually starts at the keyframe
+// at or before that point: cue + offset is short by up to one GOP (48
+// frames, ~2 s at 24 fps) and by a different amount in every run. Measured
+// on the stand (2026-09-16, same MKV, seek 600 vs seek 570): a constant
+// 1.657 s between the two runs' timelines on every shared line. Exact
+// millisecond identity therefore fails across runs, and the cost of that is
+// paid twice — translated twice, then rendered twice as two overlapping
+// near-identical cues.
+//
+// 3 s is above the measured shift and above one GOP at every frame rate we
+// transcode, and well below the gap at which a line repeated in dialogue is
+// a different cue.
+const cueMatchTolerance = 3 * time.Second
+
 // LiveDoc accumulates cues from a stream of WebVTT segments. Segments of
 // one FFmpeg run carry times from the run's start; offset is that run's
 // #EXT-X-SESSION-OFFSET, so every cue is stored in movie time. The same
 // cue reached twice (a re-read playlist, or a seek that replays a range)
-// is stored once: identity is movie time plus normalized text.
+// is stored once: identity is normalized text plus movie time within
+// cueMatchTolerance. The cue that is kept is the first one seen, with the
+// timing of the run that produced it — so its CueKey, the identity every
+// stored translation is filed under, never moves under a reader.
 type LiveDoc struct {
 	mu    sync.Mutex
 	cues  []Cue
 	items []*astisub.Item
 	keys  map[string]int
-	bytes int64
+	// byText indexes cue positions by their joined normalized text, which
+	// is what the tolerant match needs to look up before comparing times.
+	byText map[string][]int
+	bytes  int64
 }
 
-func NewLiveDoc() *LiveDoc { return &LiveDoc{keys: map[string]int{}} }
+func NewLiveDoc() *LiveDoc { return &LiveDoc{keys: map[string]int{}, byText: map[string][]int{}} }
+
+// cueText is the text half of CueKey: the joined normalized lines.
+func cueText(lines []string) string { return strings.Join(lines, "\n") }
+
+// sameCue reports whether two cues with the same text are the same cue.
+// Either end of the interval is enough: a cue that straddles the seek point
+// is clipped to the run's start, so its start carries the whole clip while
+// its end keeps only the run shift (and vice versa at the tail).
+func sameCue(aStart, aEnd, bStart, bEnd time.Duration) bool {
+	return absDuration(aStart-bStart) <= cueMatchTolerance || absDuration(aEnd-bEnd) <= cueMatchTolerance
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
+}
 
 // CueKey is the identity of a cue across runs and re-reads.
 func CueKey(start, end time.Duration, lines []string) string {
@@ -54,15 +97,37 @@ func (d *LiveDoc) AddSegment(offset time.Duration, vtt []byte) (int, error) {
 		if _, seen := d.keys[key]; seen {
 			continue
 		}
+		text := cueText(c.Lines)
+		// Structurally empty cues are matched exactly and never by
+		// tolerance: they all share the empty text, they carry no
+		// translation to reuse, and collapsing two that happen to fall
+		// within the window would drop a slot for nothing.
+		if len(c.Lines) > 0 && d.dupWithin(text, c.Start, c.End) {
+			continue
+		}
 		it := doc.Items.Items[i]
 		item := &astisub.Item{StartAt: c.Start, EndAt: c.End, InlineStyle: it.InlineStyle, Region: it.Region, Style: it.Style, Lines: it.Lines}
 		c.Index = len(d.cues)
 		d.keys[key] = c.Index
+		if len(c.Lines) > 0 {
+			d.byText[text] = append(d.byText[text], c.Index)
+		}
 		d.cues = append(d.cues, c)
 		d.items = append(d.items, item)
 		added++
 	}
 	return added, nil
+}
+
+// dupWithin reports whether a cue with this text already sits within the
+// tolerance window. Caller holds d.mu.
+func (d *LiveDoc) dupWithin(text string, start, end time.Duration) bool {
+	for _, i := range d.byText[text] {
+		if sameCue(d.cues[i].Start, d.cues[i].End, start, end) {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *LiveDoc) Len() int {

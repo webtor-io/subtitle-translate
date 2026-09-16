@@ -17,13 +17,14 @@ type livePlaylistServer struct {
 	playlist string
 	status   int
 	segments map[string]string
+	segFail  map[string]int
 	hits     map[string]int
 	srv      *httptest.Server
 }
 
 func newLivePlaylistServer(t *testing.T) *livePlaylistServer {
 	t.Helper()
-	s := &livePlaylistServer{status: 200, segments: map[string]string{}, hits: map[string]int{}}
+	s := &livePlaylistServer{status: 200, segments: map[string]string{}, segFail: map[string]int{}, hits: map[string]int{}}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -35,6 +36,11 @@ func newLivePlaylistServer(t *testing.T) *livePlaylistServer {
 			}
 			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 			_, _ = w.Write([]byte(s.playlist))
+			return
+		}
+		if st, ok := s.segFail[r.URL.Path]; ok {
+			delete(s.segFail, r.URL.Path)
+			w.WriteHeader(st)
 			return
 		}
 		if body, ok := s.segments[r.URL.Path]; ok {
@@ -55,6 +61,16 @@ func (s *livePlaylistServer) set(playlist string, segs map[string]string) {
 	for k, v := range segs {
 		s.segments["/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/"+k] = v
 	}
+}
+
+// failSegmentOnce makes the next request for one segment answer status,
+// once. The playlist keeps answering 200: a hiccup on a segment is what the
+// proxy in front of the transcoder does under load, and says nothing about
+// the session.
+func (s *livePlaylistServer) failSegmentOnce(name string, status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.segFail["/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/"+name] = status
 }
 
 func (s *livePlaylistServer) url() string {
@@ -223,5 +239,104 @@ func TestLiveSourceRetireEndsFutureRefreshes(t *testing.T) {
 	srv.mu.Unlock()
 	if hits != 1 {
 		t.Fatalf("refresh after retire must not touch the network: playlist hits=%d, want 1", hits)
+	}
+}
+
+// TestLiveSourceSegmentFailureIsTransient: only the playlist's 404/503 says
+// the session is over. A segment's is a hiccup of whatever sits between us
+// and the transcoder — torrent-http-proxy answers 503 under load and while
+// rate-limiting — and ending the translation of a whole film on one of them
+// reports a source_gone that is not true.
+func TestLiveSourceSegmentFailureIsTransient(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl2, map[string]string{"s0-0.vtt": seg0, "s0-1.vtt": seg1})
+	srv.failSegmentOnce("s0-1.vtt", 503)
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+
+	_, err := ls.Refresh(context.Background())
+	if err == nil {
+		t.Fatal("the failing segment must surface as an error")
+	}
+	if errors.Is(err, ErrSourceGone) {
+		t.Fatalf("a segment's 503 must be transient, got %v", err)
+	}
+	if ls.Gone() {
+		t.Fatal("a segment's 503 must not mark the session gone")
+	}
+
+	// The segment was never marked seen, so the next tick picks it up.
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatalf("retry after a transient segment failure: %v", err)
+	}
+	if got := ls.Doc().Len(); got != 3 {
+		t.Fatalf("doc len=%d, want 3 (both segments merged)", got)
+	}
+}
+
+// TestLiveSourcePlaylistGoneMarksGone is the other side of the same split,
+// and pins what Gone means: the transcoder's verdict on the playlist, never
+// Retire's local bookkeeping.
+func TestLiveSourcePlaylistGoneMarksGone(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	ls.Retire()
+	if _, err := ls.Refresh(context.Background()); !errors.Is(err, ErrSourceGone) {
+		t.Fatalf("want gone after retire, got %v", err)
+	}
+	if ls.Gone() {
+		t.Fatal("Retire is not evidence about the session")
+	}
+
+	srv.mu.Lock()
+	srv.status = 503
+	srv.mu.Unlock()
+	ls2 := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	if _, err := ls2.Refresh(context.Background()); !errors.Is(err, ErrSourceGone) {
+		t.Fatalf("want gone on a playlist 503, got %v", err)
+	}
+	if !ls2.Gone() {
+		t.Fatal("a 503 on the playlist ends the session")
+	}
+}
+
+// TestLiveSourceRefreshIfStaleSkipsAFreshRead: the handler calls this on
+// every poll, so a source the loop just refreshed must not cost a second
+// playlist read.
+func TestLiveSourceRefreshIfStaleSkipsAFreshRead(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	playlist := "/h/a.mkv~hls/session/0123456789abcdef0123456789abcdef/s0.m3u8"
+
+	// Never refreshed: it reads, whatever the age.
+	if _, err := ls.RefreshIfStale(context.Background(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	srv.mu.Lock()
+	first := srv.hits[playlist]
+	srv.mu.Unlock()
+	if first != 1 {
+		t.Fatalf("playlist hits=%d, want 1", first)
+	}
+
+	if _, err := ls.RefreshIfStale(context.Background(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	srv.mu.Lock()
+	second := srv.hits[playlist]
+	srv.mu.Unlock()
+	if second != 1 {
+		t.Fatalf("a fresh source must not be re-read: playlist hits=%d", second)
+	}
+
+	if _, err := ls.RefreshIfStale(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	srv.mu.Lock()
+	third := srv.hits[playlist]
+	srv.mu.Unlock()
+	if third != 2 {
+		t.Fatalf("a stale source must be re-read: playlist hits=%d", third)
 	}
 }
