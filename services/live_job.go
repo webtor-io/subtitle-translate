@@ -320,22 +320,31 @@ func syncLive(p *Progress, doc *Doc) {
 // position. A run that resumes at an offset it already covered changes
 // nothing here either: Refresh's `seen` map makes that a no-op, so there is
 // nothing new to reorder.
-func pendingByTime(doc *Doc, lines []string, current time.Duration) ([]int, []string) {
+func pendingByTime(doc *Doc, lines []string, current time.Duration) []int {
 	var aheadIdx, behindIdx []int
-	var aheadTexts, behindTexts []string
 	for _, c := range doc.Cues {
 		if len(c.Lines) == 0 || c.Index < 0 || c.Index >= len(lines) || lines[c.Index] != "" {
 			continue
 		}
 		if c.Start >= current {
 			aheadIdx = append(aheadIdx, c.Index)
-			aheadTexts = append(aheadTexts, JoinLines(c))
 		} else {
 			behindIdx = append(behindIdx, c.Index)
-			behindTexts = append(behindTexts, JoinLines(c))
 		}
 	}
-	return append(aheadIdx, behindIdx...), append(aheadTexts, behindTexts...)
+	return append(aheadIdx, behindIdx...)
+}
+
+// textsFor joins the source text of exactly the cues a batch will carry.
+// Indexes come from pendingByTime, so texts are built once per chosen batch
+// rather than once per pending cue per scan — at 5000 cues and batch 50
+// that difference is a hundred scans' worth of transient garbage.
+func textsFor(doc *Doc, idx []int) []string {
+	out := make([]string, len(idx))
+	for i, ci := range idx {
+		out[i] = JoinLines(doc.Cues[ci])
+	}
+	return out
 }
 
 // pendingFrom reports the start of the earliest untranslated cue the viewer
@@ -481,7 +490,7 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		// the same document, and the handler refreshes the source too.
 		doc := job.Live.Doc().Snapshot()
 		syncLive(p, doc)
-		idx, texts := pendingByTime(doc, p.Lines, job.Live.CurrentOffset())
+		idx := pendingByTime(doc, p.Lines, job.Live.CurrentOffset())
 		pending := len(idx)
 		now := time.Now()
 		switch {
@@ -498,13 +507,13 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		batched := false
 		if pending > 0 && (pending >= r.batchSize || now.Sub(firstPendingAt) >= r.live.BatchWait || ref.Ended || r.freshRunBlocked(job.Live, doc, p.Lines, now)) {
 			if r.batchSize > 0 && pending > r.batchSize {
-				idx, texts = idx[:r.batchSize], texts[:r.batchSize]
+				idx = idx[:r.batchSize]
 			}
 			// A failed batch (upstream or store) leaves the record with
 			// Live still set. That is the honest state: this job stopped,
 			// but the playlist did not end, and the next request for the key
 			// starts a job that picks the record up where it is.
-			if !r.runBatch(ctx, key, token, logger, job, targetName, p, idx, texts) {
+			if !r.runBatch(ctx, key, token, logger, job, targetName, p, idx, textsFor(doc, idx)) {
 				return
 			}
 			if len(idx) == pending {

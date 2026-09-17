@@ -139,7 +139,7 @@ func TestHeadDoesNotStartJob(t *testing.T) {
 // vttWithMusicAt builds n cues "line 1" … "line n", except cue index
 // musicIdx (0-based) which is a music-only line that Normalize strips to
 // zero lines — a "structurally empty" cue that is never sent for
-// translation (see pendingInBatch in job.go).
+// translation (see the pending filter in job.go).
 func vttWithMusicAt(n, musicIdx int) string {
 	var b strings.Builder
 	b.WriteString("WEBVTT\n\n")
@@ -1326,7 +1326,7 @@ func TestSyncLiveKeepsDisplacedTranslations(t *testing.T) {
 			t.Fatalf("cue %d: got %q want %q (the record was overwritten)", i, got[i], want[i])
 		}
 	}
-	if idx, _ := pendingByTime(again, got, 0); len(idx) != 0 {
+	if idx := pendingByTime(again, got, 0); len(idx) != 0 {
 		t.Fatalf("%d cues would be translated (and paid for) a second time", len(idx))
 	}
 }
@@ -1431,5 +1431,103 @@ func TestHandlerLiveFreshRunReadsOften(t *testing.T) {
 	}
 	if got := run(t, -1); got != 1 {
 		t.Fatalf("control: without FreshRun the poll interval gates: reads=%d, want 1", got)
+	}
+}
+
+// TestHandlerFilePosition: the file path speaks the live path's dialect
+// when the poll carries `pos` — the position is stored for the job, HEAD
+// and GET answer with X-Subtitle-Pending-From computed against it — and
+// stays byte-identical to the old answers when it does not.
+func TestHandlerFilePosition(t *testing.T) {
+	ft := &fakeTranslator{block: make(chan struct{})}
+	h, src := newHandlerForTest(t, ft, vttWith(2)) // cues at 0-0.5 s and 1-1.5 s
+	key := ArtifactKey("abc", "/movie.srt~vtt/movie.vtt", "pt", "m", PromptVersion)
+
+	// GET with a position: the job starts (and blocks upstream), the
+	// position lands in the store, the answer carries the frontier.
+	rec := do(h, "GET", "/x~tr:pt/movie.vtt?pos=0.7", src.URL)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if got := rec.Header().Get("X-Subtitle-Pending-From"); got != "1.000" {
+		t.Fatalf("GET frontier: %q (the cue at 0 s is behind a viewer at 0.7 s)", got)
+	}
+	if pos, ok, _ := h.Runner.store.GetPos(context.Background(), key); !ok || pos != 700*time.Millisecond {
+		t.Fatalf("stored position: %v %v", pos, ok)
+	}
+
+	// HEAD with a position answers from the same cached document — once
+	// the job has registered its progress record: a HEAD for a key with no
+	// job must never cost a source fetch.
+	waitForCalls(t, ft, 1)
+	rec = do(h, "HEAD", "/x~tr:pt/movie.vtt?pos=0.7", src.URL)
+	if got := rec.Header().Get("X-Subtitle-Pending-From"); got != "1.000" {
+		t.Fatalf("HEAD frontier: %q", got)
+	}
+	if !strings.Contains(rec.Header().Get("Access-Control-Expose-Headers"), "X-Subtitle-Pending-From") {
+		t.Fatalf("expose: %q", rec.Header().Get("Access-Control-Expose-Headers"))
+	}
+	// Behind the last cue nothing pending lies ahead: no frontier.
+	if got := do(h, "HEAD", "/x~tr:pt/movie.vtt?pos=100", src.URL).Header().Get("X-Subtitle-Pending-From"); got != "" {
+		t.Fatalf("past the end: %q", got)
+	}
+	// Without a position, the old answer: no frontier, progress-only count.
+	if got := do(h, "HEAD", "/x~tr:pt/movie.vtt", src.URL).Header().Get("X-Subtitle-Pending-From"); got != "" {
+		t.Fatalf("no pos, no frontier: %q", got)
+	}
+
+	close(ft.block)
+	waitRunnerKey(t, h.Runner, key, 2*time.Second)
+
+	// Finished: done == total, no frontier, with or without a position.
+	rec = do(h, "HEAD", "/x~tr:pt/movie.vtt?pos=0.7", src.URL)
+	if rec.Header().Get("X-Subtitle-Progress") != "100/100" || rec.Header().Get("X-Subtitle-Pending-From") != "" {
+		t.Fatalf("finished: progress=%q frontier=%q", rec.Header().Get("X-Subtitle-Progress"), rec.Header().Get("X-Subtitle-Pending-From"))
+	}
+}
+
+// TestHandlerFileHeadWithoutAJobFetchesNothing: a HEAD carrying pos for a
+// key nobody asked to translate must not turn the poll path into a source
+// fetch — no progress record, no document, the old progress-only answer.
+func TestHandlerFileHeadWithoutAJobFetchesNothing(t *testing.T) {
+	hits := 0
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(vttWith(2)))
+	}))
+	t.Cleanup(src.Close)
+	r := NewRunner(NewMemoryStore(), &fakeTranslator{}, 3, 4, time.Minute)
+	t.Cleanup(r.Close)
+	h := &Handler{Runner: r, Model: "m", Client: src.Client(), MaxSourceBytes: 1 << 20, MaxCues: 5000}
+	rec := do(h, "HEAD", "/x~tr:pt/movie.vtt?pos=10", src.URL)
+	if rec.Code != 200 || rec.Header().Get("X-Subtitle-Progress") != "0/0" {
+		t.Fatalf("code=%d progress=%q", rec.Code, rec.Header().Get("X-Subtitle-Progress"))
+	}
+	if rec.Header().Get("X-Subtitle-Pending-From") != "" {
+		t.Fatal("no job, no frontier")
+	}
+	if hits != 0 {
+		t.Fatalf("a HEAD must not fetch the source: %d fetches", hits)
+	}
+}
+
+// TestHandlerFilePartialIsSparse: a partial file body shows every translated
+// cue and no pending one, so a position-ordered job's work is visible at the
+// position instead of hidden behind an untranslated prefix.
+func TestHandlerFilePartialIsSparse(t *testing.T) {
+	ft := &fakeTranslator{block: make(chan struct{})}
+	h, src := newHandlerForTest(t, ft, vttWith(3))
+	key := ArtifactKey("abc", "/movie.srt~vtt/movie.vtt", "pt", "m", PromptVersion)
+
+	// The viewer is at 1.2 s: the job translates the cue at 2 s among the
+	// first batch (batchSize 3 covers all pending ahead: cues 1 and 2).
+	if rec := do(h, "GET", "/x~tr:pt/movie.vtt?pos=1.2", src.URL); rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	close(ft.block)
+	waitRunnerKey(t, h.Runner, key, 2*time.Second)
+	rec := do(h, "GET", "/x~tr:pt/movie.vtt?pos=1.2", src.URL)
+	if !strings.Contains(rec.Body.String(), "PT:line 3") {
+		t.Fatalf("final body: %q", rec.Body.String())
 	}
 }

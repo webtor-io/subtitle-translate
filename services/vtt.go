@@ -74,21 +74,6 @@ func (d *Doc) Normalize() {
 	}
 }
 
-func Batches(n, size int) [][2]int {
-	if size <= 0 {
-		size = 50
-	}
-	var out [][2]int
-	for from := 0; from < n; from += size {
-		to := from + size
-		if to > n {
-			to = n
-		}
-		out = append(out, [2]int{from, to})
-	}
-	return out
-}
-
 func JoinLines(c Cue) string { return strings.Join(c.Lines, lineBreakToken) }
 
 func SplitLines(s string) []string {

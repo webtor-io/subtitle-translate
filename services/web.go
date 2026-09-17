@@ -437,9 +437,9 @@ func (h *Handler) liveFor(key, sourceURL string) *LiveSource {
 // carry a hint that disagrees with the source.
 const liveHintMinAge = 500 * time.Millisecond
 
-// parseSessionOffsetHint reads the `sof` query parameter: decimal seconds,
-// finite and not negative. Anything else is no hint.
-func parseSessionOffsetHint(v string) (time.Duration, bool) {
+// parseSecondsParam reads a decimal-seconds query parameter (`sof`, `pos`):
+// finite and not negative. Anything else is no value.
+func parseSecondsParam(v string) (time.Duration, bool) {
 	if v == "" {
 		return 0, false
 	}
@@ -584,7 +584,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// the player watches the first seconds after a seek to decide
 		// whether to hold playback, and this replica may not own the job.
 		maxAge := h.Runner.LivePollInterval()
-		want, hinted := parseSessionOffsetHint(r.URL.Query().Get("sof"))
+		want, hinted := parseSecondsParam(r.URL.Query().Get("sof"))
 		disagrees := hinted && absDuration(src.CurrentOffset()-want) >= time.Second
 		if (disagrees || h.Runner.LiveFresh(src)) && liveHintMinAge < maxAge {
 			maxAge = liveHintMinAge
@@ -642,15 +642,49 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The viewer's playhead, when the poll carries one (`pos`, movie-time
+	// seconds). It is stored for the job — which orders its batches by it,
+	// the way a live job follows the playlist offset — and answered with
+	// the same X-Subtitle-Pending-From a live response carries, computed by
+	// the same function against the same kind of document. A poll without
+	// it (an old client) gets the old answer to the byte.
+	pos, hasPos := parseSecondsParam(r.URL.Query().Get("pos"))
+	if hasPos {
+		if err := h.Runner.store.PutPos(ctx, key, pos); err != nil {
+			// Best effort: order is a quality of service, not correctness.
+			// Debug, not Warn — this runs on every poll of every viewer,
+			// and a store outage must not turn the poll path into a log
+			// flood on top of everything else it breaks.
+			logger.WithError(err).Debug("failed to store the viewer position")
+		}
+	}
 	if r.Method == http.MethodHead {
 		p, _ := h.Runner.store.GetProgress(ctx, key)
+		// The frontier needs the cue timings, i.e. the document — but only
+		// for a key with a registered job (a progress record): no job means
+		// nothing to be behind of, and a poll must never turn into a source
+		// fetch a GET has not already paid for. With a record, the document
+		// comes from the same cache every GET fills (docFor) — one fetch
+		// per replica per cache TTL at worst, and never a job: HEAD
+		// reports, it does not start work. A finished artifact was already
+		// answered above (GetFinal), before this branch.
+		if hasPos && p != nil {
+			if doc, cerr := h.docFor(ctx, key, sourceURL); cerr == nil {
+				lines := sizedLines(p, len(doc.Cues))
+				from, hasPending := pendingFrom(doc, lines, pos)
+				writeVTT(w, r, nil, countDoneByIndex(lines, doc), len(doc.Cues), false, vttMeta{hasPending: hasPending, pendingFrom: from})
+				return
+			}
+			// An unavailable source is not an answer about the track:
+			// fall through to the progress-only report below.
+		}
 		done, total := 0, 0
 		if p != nil {
 			total = p.Total
-			// HEAD has no Doc, so it cannot tell a still-pending cue from one
-			// that normalized to empty and was never sent for translation
-			// (see countDone in job.go); count every filled-in line instead
-			// of stopping at the first gap, so progress keeps advancing past
+			// Without a Doc this path cannot tell a still-pending cue from
+			// one that normalized to empty and was never sent for
+			// translation; count every filled-in line instead of stopping
+			// at the first gap, so progress keeps advancing past
 			// structurally-empty cues instead of freezing there.
 			for _, l := range p.Lines {
 				if l != "" {
@@ -675,13 +709,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.Runner.Ensure(ctx, key, &Job{Lang: lang, SourceLang: ParseSourceLang(r.URL.Query().Get("srclang")), Glossary: ParseNames(r.URL.Query().Get("names")), Doc: doc})
-	snap, err := h.Runner.Snapshot(ctx, key, doc)
+	snap, err := h.Runner.Snapshot(ctx, key, doc, pos, hasPos)
 	if err != nil {
 		logger.WithError(err).Error("snapshot failed")
 		http.Error(w, msgUpstreamUnavail, http.StatusBadGateway)
 		return
 	}
-	writeVTT(w, r, snap.Body, snap.Done, snap.Total, snap.Final, vttMeta{})
+	writeVTT(w, r, snap.Body, snap.Done, snap.Total, snap.Final, vttMeta{hasPending: snap.HasPending, pendingFrom: snap.PendingFrom})
 }
 
 func (h *Handler) fetchDoc(ctx context.Context, sourceURL string) (*Doc, *clientError) {

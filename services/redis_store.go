@@ -101,6 +101,27 @@ func (r *RedisStore) PutFinal(ctx context.Context, key string, vtt []byte) error
 	return errors.Wrap(err, "s3 put")
 }
 
+// posTTL is how long a viewer's position outlives their last poll. Long
+// enough to survive a paused poll (the player suspends it on pause and on a
+// hidden tab), short enough that a job resumed a day later starts in file
+// order instead of at a position nobody is at any more.
+const posTTL = 30 * time.Minute
+
+func (r *RedisStore) PutPos(ctx context.Context, key string, pos time.Duration) error {
+	return errors.Wrap(r.rc.Get().Set(ctx, "tr:pos:"+key, pos.Milliseconds(), posTTL).Err(), "redis put pos")
+}
+
+func (r *RedisStore) GetPos(ctx context.Context, key string) (time.Duration, bool, error) {
+	ms, err := r.rc.Get().Get(ctx, "tr:pos:"+key).Int64()
+	if errors.Is(err, redis.Nil) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, errors.Wrap(err, "redis get pos")
+	}
+	return time.Duration(ms) * time.Millisecond, true, nil
+}
+
 func (r *RedisStore) GetProgress(ctx context.Context, key string) (*Progress, error) {
 	b, err := r.rc.Get().Get(ctx, "tr:cues:"+key).Bytes()
 	if errors.Is(err, redis.Nil) {

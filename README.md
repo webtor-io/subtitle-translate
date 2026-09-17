@@ -66,6 +66,29 @@ Response headers:
   seeked compares it with its own session offset to tell an answer about its
   run from one read before the transcoder listed that run.
 
+Request parameters:
+
+- `pos=<seconds>` — the viewer's playhead, in movie time. For a file source
+  this is what makes the job position-aware the way a live one is: the
+  position is kept per key (best effort, shared across replicas), batches are
+  ordered by the same rule the live loop uses — pending cues at or ahead of
+  the position first, then the backlog — and it is re-read at every batch
+  boundary, so a seek redirects the job within one batch. A poll carrying
+  `pos` is also answered with `X-Subtitle-Pending-From` computed against it,
+  by the same function the live path uses. Partial file bodies render like
+  live ones: every translated cue wherever it sits, pending cues left out
+  (a position-ordered job fills the middle of the file first, and a prefix
+  would hide exactly the cues the viewer is watching); `done` counts
+  translated cues rather than a prefix, so structurally-empty cues (nothing
+  left after normalization) count as done wherever they sit instead of only
+  inside the translated prefix — the one visible difference a poll without
+  `pos` sees. A job nobody positions translates in file order, as before.
+  Ignored on live sources (their position comes from the playlist itself).
+  The position is one per artifact key: two viewers of the same track
+  overwrite each other and the job alternates between their neighbourhoods
+  at batch granularity — every batch still shrinks the pending set, and each
+  viewer's frontier answer is computed against their own poll's `pos`.
+
 Request parameters (live sources):
 
 - `sof=<seconds>` — the session offset the player is watching. When it differs

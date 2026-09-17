@@ -95,6 +95,12 @@ func NewRunner(store Store, tr Translator, batchSize, maxJobs int, lockTTL time.
 	if maxJobs < 1 {
 		maxJobs = 1
 	}
+	if batchSize < 1 {
+		// The old loop's Batches() defaulted a non-positive size to 50;
+		// with the position-ordered loop capping directly, 0 would mean
+		// "the whole file in one prompt".
+		batchSize = 50
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Runner{store: store, tr: tr, batchSize: batchSize, lockTTL: lockTTL,
 		ctx: ctx, cancel: cancel, sem: make(chan struct{}, maxJobs), running: map[string]chan struct{}{},
@@ -119,7 +125,29 @@ func (r *Runner) Close() {
 }
 
 // Snapshot renders what is known for key without starting anything.
-func (r *Runner) Snapshot(ctx context.Context, key string, doc *Doc) (*Snapshot, error) {
+// sizedLines is a progress record's lines, padded to the document's cue
+// count. The by-index functions shared with the live path (pendingFrom,
+// pendingByTime, countDoneByIndex) skip a cue whose index is outside the
+// record — on the live path a record is always aligned to the document
+// first (alignLines), but a file job's record does not exist until the job
+// registers, and "no record yet" must read as "everything pending", not as
+// "nothing is".
+func sizedLines(p *Progress, n int) []string {
+	if p == nil || len(p.Lines) < n {
+		out := make([]string, n)
+		if p != nil {
+			copy(out, p.Lines)
+		}
+		return out
+	}
+	return p.Lines
+}
+
+// pos is the viewer's playhead when the request carried one (hasPos): it
+// decides the X-Subtitle-Pending-From half of the answer, exactly as the
+// live path's run offset does. Without one there is no frontier to report,
+// which is also every pre-position client.
+func (r *Runner) Snapshot(ctx context.Context, key string, doc *Doc, pos time.Duration, hasPos bool) (*Snapshot, error) {
 	// A finished artifact is served without re-reading the source, so the
 	// cue count is unknown here: progress is reported as 100/100 (the
 	// player treats done == total as complete).
@@ -132,31 +160,21 @@ func (r *Runner) Snapshot(ctx context.Context, key string, doc *Doc) (*Snapshot,
 	if err != nil {
 		return nil, err
 	}
-	total := len(doc.Cues)
-	var lines []string
-	if p != nil {
-		lines = p.Lines
-	}
-	done := countDone(lines, doc)
-	body, err := doc.Render(lines, done)
+	lines := sizedLines(p, len(doc.Cues))
+	// The live path's partial semantics, from the live path's functions:
+	// translated cues wherever they sit, pending ones left out (a
+	// position-ordered job fills the middle of the file first, and a
+	// prefix would hide exactly the cues the viewer is watching), done
+	// counted by index rather than as a prefix.
+	body, err := doc.RenderByIndex(lines)
 	if err != nil {
 		return nil, err
 	}
-	return &Snapshot{Body: body, Done: done, Total: total}, nil
-}
-
-// countDone is the length of the translated prefix: a cue counts as done
-// when it has a translation or was empty after normalization.
-func countDone(lines []string, doc *Doc) int {
-	n := 0
-	for i := range doc.Cues {
-		if len(doc.Cues[i].Lines) == 0 || (i < len(lines) && lines[i] != "") {
-			n++
-			continue
-		}
-		break
+	snap := &Snapshot{Body: body, Done: countDoneByIndex(lines, doc), Total: len(doc.Cues)}
+	if hasPos {
+		snap.PendingFrom, snap.HasPending = pendingFrom(doc, lines, pos)
 	}
-	return n
+	return snap, nil
 }
 
 // Ensure starts the background job once per key per process. Safe to call
@@ -307,12 +325,30 @@ func (r *Runner) run(ctx context.Context, key string, job *Job) {
 		return
 	}
 	targetName, _ := LangName(job.Lang)
-	for _, b := range Batches(len(job.Doc.Cues), r.batchSize) {
-		idx, lines := pendingInBatch(job.Doc, p.Lines, b[0], b[1])
-		if len(idx) == 0 {
-			continue
+	// The same selection the live loop makes: everything still pending,
+	// the cues at or ahead of the viewer first (pendingByTime). The
+	// position is re-read at every batch boundary, so a seek moves the
+	// job within one batch — a live job follows the playlist's offset the
+	// same way. No position (an old client, or nobody said) sorts
+	// everything "ahead", which is plain file order: the pre-position
+	// behaviour, byte for byte.
+	for batch := 0; ; batch++ {
+		pos, _, err := r.store.GetPos(ctx, key)
+		if err != nil {
+			// Best effort by contract: order is a quality of service, not
+			// correctness — but counted, or a store outage silently turns
+			// every job back into file order.
+			JobErrors.WithLabelValues("store").Inc()
+			pos = 0
 		}
-		if !r.runBatch(ctx, key, token, logger.WithField("batch", b), job, targetName, p, idx, lines) {
+		idx := pendingByTime(job.Doc, p.Lines, pos)
+		if len(idx) == 0 {
+			break
+		}
+		if r.batchSize > 0 && len(idx) > r.batchSize {
+			idx = idx[:r.batchSize]
+		}
+		if !r.runBatch(ctx, key, token, logger.WithField("batch", batch), job, targetName, p, idx, textsFor(job.Doc, idx)) {
 			return
 		}
 	}
@@ -445,22 +481,6 @@ func keepSource(p *Progress, idx []int, texts []string) {
 	for i, li := range idx {
 		p.Lines[li] = texts[i]
 	}
-}
-
-// pendingInBatch returns cue indexes in [from,to) that still need a
-// translation: non-empty after normalization and not yet translated. It
-// also returns their source text, joined per cue.
-func pendingInBatch(doc *Doc, lines []string, from, to int) ([]int, []string) {
-	var idx []int
-	var texts []string
-	for i := from; i < to; i++ {
-		if len(doc.Cues[i].Lines) == 0 || lines[i] != "" {
-			continue
-		}
-		idx = append(idx, i)
-		texts = append(texts, JoinLines(doc.Cues[i]))
-	}
-	return idx, texts
 }
 
 // lastTranslated returns up to n non-empty entries of lines preceding

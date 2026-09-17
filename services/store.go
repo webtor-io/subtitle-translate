@@ -48,6 +48,15 @@ type Store interface {
 	TryLock(ctx context.Context, key string, ttl time.Duration) (string, bool, error)
 	RefreshLock(ctx context.Context, key string, token string, ttl time.Duration) (bool, error)
 	Unlock(ctx context.Context, key string, token string) error
+	// PutPos and GetPos carry the viewer's playhead (movie time) for a key.
+	// It is what makes a file-source job position-aware the way a live one
+	// is: a live job reads the run's offset off the transcoder playlist,
+	// a file job has no playlist, so the player's polls leave the position
+	// here and the job orders its batches by it (pendingByTime, the same
+	// rule the live loop uses). Best effort on both ends: no position means
+	// file order, exactly the behaviour before positions existed.
+	PutPos(ctx context.Context, key string, pos time.Duration) error
+	GetPos(ctx context.Context, key string) (time.Duration, bool, error)
 }
 
 // newLockToken is the ownership proof stored under the lock key.
@@ -69,10 +78,25 @@ type MemoryStore struct {
 	final    map[string][]byte
 	progress map[string]*Progress
 	locks    map[string]memLock
+	pos      map[string]time.Duration
+}
+
+func (m *MemoryStore) PutPos(_ context.Context, key string, pos time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pos[key] = pos
+	return nil
+}
+
+func (m *MemoryStore) GetPos(_ context.Context, key string) (time.Duration, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.pos[key]
+	return p, ok, nil
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{final: map[string][]byte{}, progress: map[string]*Progress{}, locks: map[string]memLock{}}
+	return &MemoryStore{final: map[string][]byte{}, progress: map[string]*Progress{}, locks: map[string]memLock{}, pos: map[string]time.Duration{}}
 }
 
 func (m *MemoryStore) GetFinal(_ context.Context, key string) ([]byte, bool, error) {

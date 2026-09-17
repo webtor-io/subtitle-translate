@@ -46,22 +46,6 @@ func TestParseAndNormalize(t *testing.T) {
 	}
 }
 
-func TestBatches(t *testing.T) {
-	got := Batches(7, 3)
-	want := [][2]int{{0, 3}, {3, 6}, {6, 7}}
-	if len(got) != len(want) {
-		t.Fatalf("got %v", got)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("got %v want %v", got, want)
-		}
-	}
-	if len(Batches(0, 3)) != 0 {
-		t.Fatal("empty input must give no batches")
-	}
-}
-
 func TestRenderPartialKeepsTimingsAndOrder(t *testing.T) {
 	d, _ := ParseVTT(strings.NewReader(sampleVTT))
 	d.Normalize()

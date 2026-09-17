@@ -80,7 +80,7 @@ func TestRunnerProgressiveThenFinal(t *testing.T) {
 	ft := &fakeTranslator{block: make(chan struct{})}
 	r := NewRunner(NewMemoryStore(), ft, 3, 4, time.Minute)
 	key := "k1"
-	snap, _ := r.Snapshot(context.Background(), key, doc)
+	snap, _ := r.Snapshot(context.Background(), key, doc, 0, false)
 	if snap.Done != 0 || snap.Final || !strings.HasPrefix(string(snap.Body), "WEBVTT") {
 		t.Fatalf("initial snapshot=%+v", snap)
 	}
@@ -90,13 +90,13 @@ func TestRunnerProgressiveThenFinal(t *testing.T) {
 	// The second call starts only after batch 1 was stored, so waiting for
 	// it is the synchronisation point.
 	waitForCalls(t, ft, 2)
-	snap, _ = r.Snapshot(context.Background(), key, doc)
+	snap, _ = r.Snapshot(context.Background(), key, doc, 0, false)
 	if snap.Done != 3 || snap.Final || !strings.Contains(string(snap.Body), "PT:line 3") || strings.Contains(string(snap.Body), "line 4") {
 		t.Fatalf("after batch 1: done=%d final=%v body=%q", snap.Done, snap.Final, snap.Body)
 	}
 	close(ft.block)
 	r.Wait(key)
-	snap, _ = r.Snapshot(context.Background(), key, doc)
+	snap, _ = r.Snapshot(context.Background(), key, doc, 0, false)
 	if !snap.Final || snap.Done != 100 || snap.Total != 100 || !strings.Contains(string(snap.Body), "PT:line 7") {
 		t.Fatalf("final: %+v", snap)
 	}
@@ -117,7 +117,7 @@ func TestRunnerResumesFromStoredProgress(t *testing.T) {
 	if atomic.LoadInt32(&ft.calls) != 1 {
 		t.Fatalf("calls=%d: must translate only the missing batch", ft.calls)
 	}
-	snap, _ := r.Snapshot(context.Background(), "k2", doc)
+	snap, _ := r.Snapshot(context.Background(), "k2", doc, 0, false)
 	if !snap.Final || !strings.Contains(string(snap.Body), "PT:line 1") || !strings.Contains(string(snap.Body), "PT:line 6") {
 		t.Fatalf("final=%+v", snap)
 	}
@@ -130,7 +130,7 @@ func TestRunnerKeepsOriginalOnLineMismatch(t *testing.T) {
 	r := NewRunner(NewMemoryStore(), ft, 50, 4, time.Minute)
 	r.Ensure(context.Background(), "k3", &Job{Lang: "pt", Doc: doc})
 	r.Wait("k3")
-	snap, _ := r.Snapshot(context.Background(), "k3", doc)
+	snap, _ := r.Snapshot(context.Background(), "k3", doc, 0, false)
 	if !snap.Final || !strings.Contains(string(snap.Body), "line 1") {
 		t.Fatalf("mismatch must fall back to originals and still finish: %+v", snap)
 	}
@@ -144,7 +144,7 @@ func TestRunnerStopsOnUpstreamErrorKeepingProgress(t *testing.T) {
 	r := NewRunner(st, ft, 50, 4, time.Minute)
 	r.Ensure(context.Background(), "k4", &Job{Lang: "pt", Doc: doc})
 	r.Wait("k4")
-	snap, _ := r.Snapshot(context.Background(), "k4", doc)
+	snap, _ := r.Snapshot(context.Background(), "k4", doc, 0, false)
 	if snap.Final || snap.Done != 0 {
 		t.Fatalf("must not finish on upstream error: %+v", snap)
 	}
@@ -182,7 +182,7 @@ func TestRunnerSplitsTruncatedBatches(t *testing.T) {
 	r := NewRunner(NewMemoryStore(), ft, 50, 4, time.Minute)
 	r.Ensure(context.Background(), "k5", &Job{Lang: "pt", Doc: doc})
 	r.Wait("k5")
-	snap, _ := r.Snapshot(context.Background(), "k5", doc)
+	snap, _ := r.Snapshot(context.Background(), "k5", doc, 0, false)
 	if !snap.Final {
 		t.Fatalf("job must finish: %+v", snap)
 	}
@@ -201,7 +201,7 @@ func TestRunnerKeepsSourceForSingleCueTruncation(t *testing.T) {
 	r := NewRunner(NewMemoryStore(), ft, 50, 4, time.Minute)
 	r.Ensure(context.Background(), "k6", &Job{Lang: "pt", Doc: doc})
 	r.Wait("k6")
-	snap, _ := r.Snapshot(context.Background(), "k6", doc)
+	snap, _ := r.Snapshot(context.Background(), "k6", doc, 0, false)
 	if !snap.Final || !strings.Contains(string(snap.Body), "line 1") || strings.Contains(string(snap.Body), "PT:") {
 		t.Fatalf("single-cue truncation must keep originals and finish: %+v", snap)
 	}
@@ -214,7 +214,7 @@ func TestRunnerFillsSourceOnRefusal(t *testing.T) {
 	r := NewRunner(NewMemoryStore(), ft, 2, 4, time.Minute)
 	r.Ensure(context.Background(), "k7", &Job{Lang: "pt", Doc: doc})
 	r.Wait("k7")
-	snap, _ := r.Snapshot(context.Background(), "k7", doc)
+	snap, _ := r.Snapshot(context.Background(), "k7", doc, 0, false)
 	if !snap.Final || !strings.Contains(string(snap.Body), "line 4") || strings.Contains(string(snap.Body), "PT:") {
 		t.Fatalf("refusal must keep originals and finish: %+v", snap)
 	}
@@ -253,7 +253,7 @@ func TestRunnerAbortsWhenLockIsLost(t *testing.T) {
 	if got := atomic.LoadInt32(&ft.calls); got != 1 {
 		t.Fatalf("calls=%d: the job must stop at the first lost refresh", got)
 	}
-	snap, _ := r.Snapshot(context.Background(), "k8", doc)
+	snap, _ := r.Snapshot(context.Background(), "k8", doc, 0, false)
 	if snap.Final {
 		t.Fatal("a job that lost its lock must not publish a final artifact")
 	}
@@ -393,7 +393,8 @@ func TestPendingByTimeAheadOfPlayheadFirst(t *testing.T) {
 		cue(4, 650, 600*time.Second, "y"),
 	}}
 	lines := make([]string, len(doc.Cues))
-	idx, texts := pendingByTime(doc, lines, 600*time.Second)
+	idx := pendingByTime(doc, lines, 600*time.Second)
+	texts := textsFor(doc, idx)
 	if len(idx) != 5 {
 		t.Fatalf("idx=%v, want all 5 cues pending", idx)
 	}
@@ -426,7 +427,8 @@ func TestPendingByTimeAheadOfPlayheadWinsAcrossIngestRuns(t *testing.T) {
 		cue(2, 240, 150*time.Second, "p2"), // ahead of it, same (earlier) ingest run
 	}}
 	lines := make([]string, len(doc.Cues))
-	idx, texts := pendingByTime(doc, lines, 180*time.Second)
+	idx := pendingByTime(doc, lines, 180*time.Second)
+	texts := textsFor(doc, idx)
 	if len(idx) != 3 {
 		t.Fatalf("idx=%v, want all 3 cues pending", idx)
 	}
@@ -1155,5 +1157,79 @@ func TestLiveRunnerRetriesAFailedFreshRead(t *testing.T) {
 	}
 	if atomic.LoadInt32(&tr.calls) == 0 {
 		t.Fatal("the failed fresh read was not retried within a few seconds")
+	}
+}
+
+// TestRunnerBatchTranslatesAheadOfPositionFirst: a file job orders its
+// batches the way a live one does — the viewer's position first (the player
+// leaves it with every poll), then the backlog — and re-reads the position
+// at every batch boundary, so a seek moves the job within one batch.
+func TestRunnerBatchTranslatesAheadOfPositionFirst(t *testing.T) {
+	doc, _ := ParseVTT(strings.NewReader(vttWith(4))) // cues at 0,1,2,3 s
+	doc.Normalize()
+	ft := &fakeTranslator{block: make(chan struct{})}
+	st := NewMemoryStore()
+	r := NewRunner(st, ft, 1, 4, time.Minute) // one cue per batch
+	t.Cleanup(r.Close)
+
+	// The viewer is at 2 s when the job starts.
+	if err := st.PutPos(context.Background(), "k", 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Doc: doc})
+	waitForCalls(t, ft, 1)
+	// They seek back to the start while the first batch is upstream.
+	if err := st.PutPos(context.Background(), "k", 0); err != nil {
+		t.Fatal(err)
+	}
+	close(ft.block)
+	r.Wait("k")
+
+	want := [][]string{{"line 3"}, {"line 1"}, {"line 2"}, {"line 4"}}
+	got := ft.requests()
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("batch order: got %v, want %v (position first, then re-read per batch)", got, want)
+	}
+	if _, ok, _ := st.GetFinal(context.Background(), "k"); !ok {
+		t.Fatal("the job must still finish the whole file")
+	}
+}
+
+// TestSnapshotIsSparseAndCarriesTheFrontier: a partial file answer uses the
+// live path's semantics — translated cues wherever they sit, pending ones
+// left out — and, when the poll says where the viewer is, the same
+// X-Subtitle-Pending-From fields a live answer carries.
+func TestSnapshotIsSparseAndCarriesTheFrontier(t *testing.T) {
+	doc, _ := ParseVTT(strings.NewReader(vttWith(3))) // cues at 0,1,2 s
+	doc.Normalize()
+	st := NewMemoryStore()
+	r := NewRunner(st, &fakeTranslator{}, 3, 4, time.Minute)
+	t.Cleanup(r.Close)
+	if err := st.PutProgress(context.Background(), "k", &Progress{Total: 3, Lines: []string{"", "PT:line 2", ""}}); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := r.Snapshot(context.Background(), "k", doc, time.Second, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(snap.Body)
+	if !strings.Contains(body, "PT:line 2") || strings.Contains(body, "line 1") || strings.Contains(body, "line 3") {
+		t.Fatalf("sparse body: %q", body)
+	}
+	if snap.Done != 1 || snap.Total != 3 {
+		t.Fatalf("done=%d total=%d", snap.Done, snap.Total)
+	}
+	// At 1 s the cue at 0-0.5 s is behind the viewer; the earliest pending
+	// cue they can still meet starts at 2 s.
+	if !snap.HasPending || snap.PendingFrom != 2*time.Second {
+		t.Fatalf("frontier: %v %v", snap.HasPending, snap.PendingFrom)
+	}
+	// No position, no frontier: the pre-position answer.
+	snap, err = r.Snapshot(context.Background(), "k", doc, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.HasPending {
+		t.Fatal("a poll that does not say where the viewer is gets no frontier")
 	}
 }
