@@ -445,6 +445,17 @@ func (s *LiveSource) RunStartedAt() time.Time {
 	return s.runStartedAt
 }
 
+// Nudge asks the job for another read without a new run: one token on the
+// same channel, never blocking. The job spaces wake-driven reads by
+// liveWakeMinGap, so a nudge after every failed read is at most one read per
+// second.
+func (s *LiveSource) Nudge() {
+	select {
+	case s.runStarted <- struct{}{}:
+	default:
+	}
+}
+
 // RunStarted delivers one token each time a read sees a new run. Buffered by
 // one: a job that was busy picks it up on its next select, and several runs
 // seen in between collapse into one wake-up.

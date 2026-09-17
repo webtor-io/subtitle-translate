@@ -579,8 +579,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// ~200 ms after the seek POST, the player's first poll after a seek
 		// lands ~100 ms after it, so the poll-interval gate answered the
 		// question "is the new position translated" about the old run.
+		//
+		// The same short gate holds for a fresh run (LiveConfig.FreshRun):
+		// the player watches the first seconds after a seek to decide
+		// whether to hold playback, and this replica may not own the job.
 		maxAge := h.Runner.LivePollInterval()
-		if want, ok := parseSessionOffsetHint(r.URL.Query().Get("sof")); ok && absDuration(src.CurrentOffset()-want) >= time.Second {
+		want, hinted := parseSessionOffsetHint(r.URL.Query().Get("sof"))
+		disagrees := hinted && absDuration(src.CurrentOffset()-want) >= time.Second
+		if (disagrees || h.Runner.LiveFresh(src)) && liveHintMinAge < maxAge {
 			maxAge = liveHintMinAge
 		}
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sourceFetchTimeout)

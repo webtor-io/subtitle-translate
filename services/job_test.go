@@ -1125,3 +1125,35 @@ func TestLiveRunnerWakeUpsAreSpaced(t *testing.T) {
 		t.Fatalf("ten new runs in 200 ms made the job read %d times; wake-ups must be spaced", jobReads)
 	}
 }
+
+// TestLiveRunnerRetriesAFailedFreshRead: a new run's first segment failing
+// once must not cost the viewer a whole poll interval; the job reads again
+// after liveWakeMinGap.
+func TestLiveRunnerRetriesAFailedFreshRead(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	seek := "#EXTM3U\n#EXT-X-SESSION-OFFSET:600\n#EXTINF:2.0,\ns0-9.vtt?token=T\n"
+	srv.set(seek, map[string]string{"s0-9.vtt": "WEBVTT\n\n00:00.000 --> 00:01.000\nseeked line\n"})
+	tr := &fakeTranslator{}
+	r, _ := newLiveRunner(t, tr, 50, LiveConfig{PollInterval: time.Hour, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	// A viewer's poll sees the new run first (its wake-up token is queued)
+	// and its segment read fails.
+	srv.failSegmentOnce("s0-9.vtt", 503)
+	if _, err := ls.Refresh(context.Background()); err == nil {
+		t.Fatal("setup: the first segment read must fail")
+	}
+	// The job spends that token on its own read, which fails as well; the
+	// run is no longer new, so that read queues no token of its own.
+	srv.failSegmentOnce("s0-9.vtt", 503)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	// The ticker never fires inside this test: only the nudge after the
+	// failed read can bring the job back to translate.
+	deadline := time.Now().Add(3 * time.Second)
+	for atomic.LoadInt32(&tr.calls) == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&tr.calls) == 0 {
+		t.Fatal("the failed fresh read was not retried within a few seconds")
+	}
+}

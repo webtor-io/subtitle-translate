@@ -461,6 +461,12 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 			// Transient: a timeout, a 5xx, a half-written playlist. The next
 			// tick reads the whole playlist again, so nothing is lost.
 			logger.WithError(err).Warn("failed to refresh the live source")
+			// In a fresh run the viewer is waiting on exactly this read (a
+			// new run's first segment is the likeliest to fail once): ask
+			// for another one after liveWakeMinGap instead of a whole tick.
+			if r.LiveFresh(job.Live) {
+				job.Live.Nudge()
+			}
 			// A transient failure (Refresh runs under its own 30s deadline,
 			// so this is often context.DeadlineExceeded on a slow catch-up)
 			// must not skip the lease refresh or the viewer-gone check: both
@@ -664,6 +670,19 @@ func (r *Runner) putProgress(ctx context.Context, key string, logger *log.Entry,
 // handler reads it too: it is the staleness bound for the source it serves
 // (see LiveSource.RefreshIfStale).
 func (r *Runner) LivePollInterval() time.Duration { return r.live.PollInterval }
+
+// LiveFresh reports whether src's current run started less than FreshRun
+// ago. The handler reads a fresh run's playlist more often: the player
+// decides whether to hold playback for a seek's subtitles from the answers
+// in those first seconds, and on a replica that does not own the job the
+// poll-interval gate would leave them describing a document seconds old.
+func (r *Runner) LiveFresh(src *LiveSource) bool {
+	if r.live.FreshRun < 0 {
+		return false
+	}
+	started := src.RunStartedAt()
+	return !started.IsZero() && time.Since(started) < r.live.FreshRun
+}
 
 // LiveHead is what LiveProgress reports: the counts and flags HEAD needs,
 // without the body LiveSnapshot renders alongside them.

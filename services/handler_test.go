@@ -1406,3 +1406,30 @@ func TestHandlerLiveSessionOffsetHint(t *testing.T) {
 		}
 	}
 }
+
+// TestHandlerLiveFreshRunReadsOften: for FreshRun after a run starts, polls
+// re-read the playlist every liveHintMinAge rather than every poll interval.
+// The player decides whether to hold playback for a seek's subtitles from
+// those first answers, and a replica that does not own the job would
+// otherwise serve a document seconds old.
+func TestHandlerLiveFreshRunReadsOften(t *testing.T) {
+	run := func(t *testing.T, fresh time.Duration) int {
+		srv := newLivePlaylistServer(t)
+		r := NewRunner(NewMemoryStore(), &fakeTranslator{}, 3, 4, time.Minute)
+		r.SetLive(LiveConfig{PollInterval: time.Hour, BatchWait: time.Hour, Idle: time.Minute, FreshRun: fresh})
+		t.Cleanup(r.Close)
+		h := &Handler{Runner: r, Model: "m", Client: srv.srv.Client(), MaxSourceBytes: 1 << 20, MaxCues: 5000}
+		srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+		playlist := "/h/a.mkv~hls/session/" + liveSessionID + "/s0.m3u8"
+		doLive(h, "HEAD", srv.url())
+		time.Sleep(liveHintMinAge + 50*time.Millisecond)
+		doLive(h, "HEAD", srv.url())
+		return srv.hitCount(playlist)
+	}
+	if got := run(t, time.Minute); got != 2 {
+		t.Fatalf("a fresh run is re-read after liveHintMinAge: reads=%d, want 2", got)
+	}
+	if got := run(t, -1); got != 1 {
+		t.Fatalf("control: without FreshRun the poll interval gates: reads=%d, want 1", got)
+	}
+}

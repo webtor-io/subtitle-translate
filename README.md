@@ -74,7 +74,12 @@ Request parameters (live sources):
   `--live-poll-interval`. Measured on a real session: the transcoder lists a
   new run ~200 ms after the seek POST and the player's first poll after a seek
   lands ~100 ms after it, so without this the answer after a seek described
-  the old run for seconds. Not negative, finite, or it is ignored.
+  the old run for seconds. Not negative, finite, or it is ignored. The same
+  500 ms gate applies for the first 30 s of a run whatever the poll says: the
+  player decides whether to hold playback for a seek's subtitles from those
+  first answers, and a replica that does not own the job would otherwise serve
+  a document seconds old. A failed read in a fresh run is retried by the job
+  after 1 s instead of a poll interval.
 
 Status codes:
 
