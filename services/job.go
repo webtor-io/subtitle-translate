@@ -49,6 +49,14 @@ type Snapshot struct {
 	// snapshot at all. Only LiveSnapshot and LiveProgress set these.
 	PendingFrom time.Duration
 	HasPending  bool
+	// SessionOffset is the #EXT-X-SESSION-OFFSET the pending-from answer was
+	// computed against, sent as X-Subtitle-Session-Offset. A client that has
+	// just seeked compares it with its own session offset to tell an answer
+	// about its run from one read before the transcoder listed that run.
+	// HasSessionOffset is false until the source has read a playlist, and
+	// on every non-live snapshot.
+	SessionOffset    time.Duration
+	HasSessionOffset bool
 }
 
 type Runner struct {
@@ -388,6 +396,15 @@ func (r *Runner) translateChunk(ctx context.Context, logger *log.Entry, job *Job
 	switch {
 	case err == nil:
 		for i, li := range idx {
+			// An empty reply line for a cue that has text would leave the
+			// cue pending forever: re-sent with every later batch and, on a
+			// live source, pinning X-Subtitle-Pending-From to it for the rest
+			// of the run. The original text is what the viewer gets instead,
+			// as for every other reply that cannot be used.
+			if strings.TrimSpace(res.Lines[i]) == "" {
+				p.Lines[li] = texts[i]
+				continue
+			}
 			p.Lines[li] = res.Lines[i]
 		}
 		BatchesTotal.Inc()

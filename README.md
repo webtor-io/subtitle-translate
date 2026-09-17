@@ -60,6 +60,21 @@ Response headers:
   - Absent when there is no such cue: everything at or ahead of the current
     position is translated, the response is a finished/final artifact, or
     `X-Source-Url` is not a live playlist at all.
+- `X-Subtitle-Session-Offset: <seconds>` — on live responses once the playlist
+  has been read: the `#EXT-X-SESSION-OFFSET` the answer (and
+  `X-Subtitle-Pending-From`) was computed against. A player that has just
+  seeked compares it with its own session offset to tell an answer about its
+  run from one read before the transcoder listed that run.
+
+Request parameters (live sources):
+
+- `sof=<seconds>` — the session offset the player is watching. When it differs
+  from the run the source last read by a second or more, the playlist is
+  re-read now (at most once per 500 ms per key per replica) instead of after
+  `--live-poll-interval`. Measured on a real session: the transcoder lists a
+  new run ~200 ms after the seek POST and the player's first poll after a seek
+  lands ~100 ms after it, so without this the answer after a seek described
+  the old run for seconds. Not negative, finite, or it is ignored.
 
 Status codes:
 
@@ -120,9 +135,15 @@ a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
   can still meet is translated at once instead of waiting `--live-batch-wait`
   for company: that is when the viewer is standing on untranslated cues. A
   new run seen by a viewer's poll also wakes the job immediately rather than
-  on its next `--live-poll-interval` tick. Without these, the first line at a
-  new position waited for a tick, then for the batch window, then for the
-  upstream call.
+  on its next `--live-poll-interval` tick (no sooner than 1 s after its previous
+  read, so a flapping offset cannot make it read back to back). The run is
+  taken from the playlist header before any segment is fetched, so a failing
+  newest segment does not hide it. Without these, the first line at a new
+  position waited for a tick, then for the batch window, then for the upstream
+  call.
+- A reply line that comes back empty for a cue with text keeps the original
+  text, like every other unusable reply: stored as empty it stayed pending
+  forever, re-sent with every batch and pinning `X-Subtitle-Pending-From`.
 - `X-Subtitle-Pending-From` tells a poller whether the *next* cue the viewer
   will actually reach is translated yet — something the done/total counts
   cannot answer, since in live mode there is almost always an untranslated

@@ -37,6 +37,12 @@ type LiveConfig struct {
 // viewer in.
 const defaultFreshRun = 30 * time.Second
 
+// liveWakeMinGap is the least time between two playlist reads the job does
+// because of a wake-up. A wake-up means a new run; a playlist whose offset
+// flaps (two tabs of one session seeking in turn, a stale response racing a
+// restart) would otherwise have the job reading back to back.
+const liveWakeMinGap = time.Second
+
 // SetLive replaces the live loop's timings. A zero field keeps the default.
 // Call it before the first job starts: it rebuilds the live semaphore.
 func (r *Runner) SetLive(cfg LiveConfig) {
@@ -128,15 +134,18 @@ func (r *Runner) LiveSnapshot(ctx context.Context, key string, src *LiveSource) 
 	if p != nil {
 		status = p.Status
 	}
-	from, hasPending := pendingFrom(doc, lines, src.CurrentOffset())
+	offset := src.CurrentOffset()
+	from, hasPending := pendingFrom(doc, lines, offset)
 	return &Snapshot{
-		Body:        body,
-		Done:        countDoneByIndex(lines, doc),
-		Total:       len(doc.Cues),
-		Live:        p == nil || p.Live,
-		Status:      status,
-		PendingFrom: from,
-		HasPending:  hasPending,
+		Body:             body,
+		Done:             countDoneByIndex(lines, doc),
+		Total:            len(doc.Cues),
+		Live:             p == nil || p.Live,
+		Status:           status,
+		PendingFrom:      from,
+		HasPending:       hasPending,
+		SessionOffset:    offset,
+		HasSessionOffset: !src.RunStartedAt().IsZero(),
 	}, nil
 }
 
@@ -403,6 +412,7 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 	// changed nothing does not rewrite the same record.
 	published := -1
 	lockedAt := time.Now()
+	var lastPoll time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -411,7 +421,26 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		// A new run seen by a handler's refresh (a viewer's poll after a
 		// seek) wakes the job at once rather than on its next tick.
 		case <-job.Live.RunStarted():
+			// Delayed, not dropped: a seek landing right after the job's
+			// own read still gets its read within liveWakeMinGap, or on the
+			// next tick if that comes first.
+			if d := liveWakeMinGap - time.Since(lastPoll); d > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(d):
+				case <-ticker.C:
+				}
+			}
 		}
+		// A wake-up queued before this read is answered by it. A handler's
+		// read landing between this drain and the job's own leaves its token
+		// for the next iteration: one extra read, never a lost wake-up.
+		select {
+		case <-job.Live.RunStarted():
+		default:
+		}
+		lastPoll = time.Now()
 		ref, err := r.pollLive(ctx, job)
 		switch {
 		case err == nil:
@@ -646,6 +675,10 @@ type LiveHead struct {
 	// contract as Snapshot: see its doc comment.
 	PendingFrom time.Duration
 	HasPending  bool
+	// SessionOffset and HasSessionOffset: the X-Subtitle-Session-Offset
+	// contract, see Snapshot.
+	SessionOffset    time.Duration
+	HasSessionOffset bool
 }
 
 // LiveProgress is LiveSnapshot without the body: the same alignment, the
@@ -670,13 +703,16 @@ func (r *Runner) LiveProgress(ctx context.Context, key string, src *LiveSource) 
 	if p != nil {
 		st = p.Status
 	}
-	from, hasPending := pendingFrom(doc, lines, src.CurrentOffset())
+	offset := src.CurrentOffset()
+	from, hasPending := pendingFrom(doc, lines, offset)
 	return LiveHead{
-		Done:        countDoneByIndex(lines, doc),
-		Total:       len(doc.Cues),
-		Live:        p == nil || p.Live,
-		Status:      st,
-		PendingFrom: from,
-		HasPending:  hasPending,
+		Done:             countDoneByIndex(lines, doc),
+		Total:            len(doc.Cues),
+		Live:             p == nil || p.Live,
+		Status:           st,
+		PendingFrom:      from,
+		HasPending:       hasPending,
+		SessionOffset:    offset,
+		HasSessionOffset: !src.RunStartedAt().IsZero(),
 	}, nil
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -431,6 +432,24 @@ func (h *Handler) liveFor(key, sourceURL string) *LiveSource {
 	return e.cur
 }
 
+// liveHintMinAge bounds the re-reads a `sof` hint can force: at most one
+// playlist read per key per replica per this interval, however many polls
+// carry a hint that disagrees with the source.
+const liveHintMinAge = 500 * time.Millisecond
+
+// parseSessionOffsetHint reads the `sof` query parameter: decimal seconds,
+// finite and not negative. Anything else is no hint.
+func parseSessionOffsetHint(v string) (time.Duration, bool) {
+	if v == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > 1e7 {
+		return 0, false
+	}
+	return time.Duration(f * float64(time.Second)), true
+}
+
 // liveRefresh refreshes the source this request is serving and returns the
 // source the rest of the request must use — which is not always the one it
 // came in with.
@@ -551,8 +570,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The source is cached and shared with whoever polls this key next,
 		// so — like docFor's fetch — this read must not die with this
 		// request's own connection.
+		//
+		// A poll that says which run it is watching (`sof`, the player's own
+		// session offset, sent after a seek) and names a different one than
+		// the source last read is not served the stale document for a poll
+		// interval: the playlist is re-read as soon as liveHintMinAge allows.
+		// Measured on a real session: the transcoder lists the new run
+		// ~200 ms after the seek POST, the player's first poll after a seek
+		// lands ~100 ms after it, so the poll-interval gate answered the
+		// question "is the new position translated" about the old run.
+		maxAge := h.Runner.LivePollInterval()
+		if want, ok := parseSessionOffsetHint(r.URL.Query().Get("sof")); ok && absDuration(src.CurrentOffset()-want) >= time.Second {
+			maxAge = liveHintMinAge
+		}
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sourceFetchTimeout)
-		src, rerr := h.liveRefresh(rctx, key, sourceURL, src, h.Runner.LivePollInterval())
+		src, rerr := h.liveRefresh(rctx, key, sourceURL, src, maxAge)
 		cancel()
 		if rerr != nil {
 			switch {
@@ -584,10 +616,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			writeVTT(w, r, nil, head.Done, head.Total, false, vttMeta{
-				live:        head.Live,
-				status:      head.Status,
-				hasPending:  head.HasPending,
-				pendingFrom: head.PendingFrom,
+				live:             head.Live,
+				status:           head.Status,
+				hasPending:       head.HasPending,
+				pendingFrom:      head.PendingFrom,
+				hasSessionOffset: head.HasSessionOffset,
+				sessionOffset:    head.SessionOffset,
 			})
 			return
 		}
@@ -708,6 +742,10 @@ type vttMeta struct {
 	// source — see pendingFrom's doc comment for what "pending" means.
 	hasPending  bool
 	pendingFrom time.Duration
+	// hasSessionOffset sets X-Subtitle-Session-Offset to sessionOffset, the
+	// run the pending-from answer describes.
+	hasSessionOffset bool
+	sessionOffset    time.Duration
 }
 
 // writeVTT renders a response, adding whatever meta carries to the header
@@ -730,6 +768,10 @@ func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total i
 		w.Header().Set("X-Subtitle-Pending-From", strconv.FormatFloat(meta.pendingFrom.Seconds(), 'f', 3, 64))
 		expose = append(expose, "X-Subtitle-Pending-From")
 	}
+	if meta.hasSessionOffset {
+		w.Header().Set("X-Subtitle-Session-Offset", strconv.FormatFloat(meta.sessionOffset.Seconds(), 'f', 3, 64))
+		expose = append(expose, "X-Subtitle-Session-Offset")
+	}
 	w.Header().Set("Access-Control-Expose-Headers", strings.Join(expose, ", "))
 	if final {
 		w.Header().Set("Cache-Control", "public, max-age=86400")
@@ -749,9 +791,11 @@ func writeVTT(w http.ResponseWriter, r *http.Request, body []byte, done, total i
 // contract a regular track's snapshot uses.
 func writeVTTLive(w http.ResponseWriter, r *http.Request, body []byte, snap *Snapshot) {
 	writeVTT(w, r, body, snap.Done, snap.Total, snap.Final, vttMeta{
-		live:        snap.Live,
-		status:      snap.Status,
-		hasPending:  snap.HasPending,
-		pendingFrom: snap.PendingFrom,
+		live:             snap.Live,
+		status:           snap.Status,
+		hasPending:       snap.HasPending,
+		pendingFrom:      snap.PendingFrom,
+		hasSessionOffset: snap.HasSessionOffset,
+		sessionOffset:    snap.SessionOffset,
 	})
 }

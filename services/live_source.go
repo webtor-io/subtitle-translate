@@ -85,18 +85,22 @@ type LiveSource struct {
 	// last longer than a poll interval.
 	lastAttempt time.Time
 	// currentOffset is the #EXT-X-SESSION-OFFSET of the most recent
-	// successful playlist read: the playhead pendingByTime compares each
+	// playlist that parsed: the playhead pendingByTime compares each
 	// pending cue's Start against, so cues at or ahead of it are translated
 	// before the backlog behind it. A failed attempt leaves it as it was —
 	// nothing about the current position changed, only the attempt to
 	// confirm it failed.
 	currentOffset time.Duration
 	// runStartedAt is when a read first saw the current run: the first
-	// successful read, or the first one whose #EXT-X-SESSION-OFFSET differs
-	// from the previous. runStarted gets one token at that moment (buffered,
-	// never blocks) so the job can react before its next tick.
+	// playlist that parsed, or the first one whose #EXT-X-SESSION-OFFSET
+	// differs from the previous. Taken from the playlist header, before any
+	// segment is fetched: a new run's newest segment is the likeliest one to
+	// fail once, and that must not hide the run itself for a poll interval.
+	// runStarted gets one token at that moment (buffered, never blocks) so
+	// the job can react before its next tick.
 	runStartedAt time.Time
 	runStarted   chan struct{}
+	offsetSeen   bool
 }
 
 func NewLiveSource(playlistURL string, client *http.Client, maxBytes int64, maxCues int) *LiveSource {
@@ -346,6 +350,17 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 	if err != nil {
 		return Refresh{}, err
 	}
+	s.mu.Lock()
+	if !s.offsetSeen || pl.Offset != s.currentOffset {
+		s.runStartedAt = time.Now()
+		select {
+		case s.runStarted <- struct{}{}:
+		default:
+		}
+	}
+	s.offsetSeen = true
+	s.currentOffset = pl.Offset
+	s.mu.Unlock()
 	var out Refresh
 	for _, seg := range pl.Segments {
 		key := fmt.Sprintf("%d|%s", pl.Offset/time.Millisecond, seg.Name)
@@ -417,16 +432,7 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 		s.runEnded = false
 	}
 	out.Ended = s.ended
-	now := time.Now()
-	if s.lastRefresh.IsZero() || pl.Offset != s.currentOffset {
-		s.runStartedAt = now
-		select {
-		case s.runStarted <- struct{}{}:
-		default:
-		}
-	}
-	s.lastRefresh = now
-	s.currentOffset = pl.Offset
+	s.lastRefresh = time.Now()
 	s.mu.Unlock()
 	return out, nil
 }

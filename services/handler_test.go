@@ -1330,3 +1330,79 @@ func TestSyncLiveKeepsDisplacedTranslations(t *testing.T) {
 		t.Fatalf("%d cues would be translated (and paid for) a second time", len(idx))
 	}
 }
+
+func doLiveQuery(h http.Handler, method, sourceURL, query string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, "/s0.vtt?"+query, nil)
+	req.Header.Set("X-Mod-Extra", "pt")
+	req.Header.Set("X-Info-Hash", "abc")
+	req.Header.Set("X-Path", "/a.mkv~hls/session/0123456789abcdef0123456789abcdef/s0.m3u8")
+	req.Header.Set("X-Source-Url", sourceURL)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestHandlerLiveSessionOffsetHint: a poll that names the run it watches
+// (`sof`, sent by the player after a seek) and disagrees with the run the
+// source last read makes the handler re-read the playlist now, not after the
+// poll interval; every live answer says which run it describes
+// (X-Subtitle-Session-Offset). Measured on a real session: the transcoder
+// lists a new run ~200 ms after the seek POST, the player's first poll lands
+// ~100 ms after it, and the poll-interval gate then answered about the old
+// run for seconds.
+func TestHandlerLiveSessionOffsetHint(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	r := NewRunner(NewMemoryStore(), &fakeTranslator{}, 3, 4, time.Minute)
+	// A poll interval that never passes inside this test: only the hint can
+	// cause a second read.
+	r.SetLive(LiveConfig{PollInterval: time.Hour, BatchWait: time.Hour, Idle: time.Minute, FreshRun: -1})
+	t.Cleanup(r.Close)
+	h := &Handler{Runner: r, Model: "m", Client: srv.srv.Client(), MaxSourceBytes: 1 << 20, MaxCues: 5000}
+	playlist := "/h/a.mkv~hls/session/" + liveSessionID + "/s0.m3u8"
+	offset := func(rec *httptest.ResponseRecorder) string { return rec.Header().Get("X-Subtitle-Session-Offset") }
+
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	rec := doLive(h, "HEAD", srv.url())
+	if offset(rec) != "0.000" || !strings.Contains(rec.Header().Get("Access-Control-Expose-Headers"), "X-Subtitle-Session-Offset") {
+		t.Fatalf("first answer: offset=%q expose=%q", offset(rec), rec.Header().Get("Access-Control-Expose-Headers"))
+	}
+	reads := srv.hitCount(playlist)
+
+	// The transcoder moves to a new run.
+	seek := "#EXTM3U\n#EXT-X-SESSION-OFFSET:600\n#EXTINF:2.0,\ns0-9.vtt?token=T\n"
+	srv.set(seek, map[string]string{"s0-9.vtt": "WEBVTT\n\n00:00.000 --> 00:01.000\nseeked line\n"})
+
+	if rec := doLive(h, "HEAD", srv.url()); offset(rec) != "0.000" || srv.hitCount(playlist) != reads {
+		t.Fatalf("no hint: the poll-interval gate holds (offset=%q reads=%d, want %d)", offset(rec), srv.hitCount(playlist), reads)
+	}
+	// The hint re-reads as soon as liveHintMinAge has passed since the last
+	// read, not after the hour-long poll interval.
+	time.Sleep(liveHintMinAge + 50*time.Millisecond)
+	rec = doLiveQuery(h, "HEAD", srv.url(), "sof=600")
+	if offset(rec) != "600.000" || srv.hitCount(playlist) != reads+1 {
+		t.Fatalf("a disagreeing hint re-reads now: offset=%q reads=%d, want %d", offset(rec), srv.hitCount(playlist), reads+1)
+	}
+	if rec.Header().Get("X-Subtitle-Pending-From") != "600.000" {
+		t.Fatalf("and the answer is about the new run: pending-from=%q", rec.Header().Get("X-Subtitle-Pending-From"))
+	}
+	if doLiveQuery(h, "HEAD", srv.url(), "sof=600"); srv.hitCount(playlist) != reads+1 {
+		t.Fatalf("an agreeing hint is not a reason to read: reads=%d", srv.hitCount(playlist))
+	}
+	// A hint that keeps disagreeing (a stale or hostile client) costs at most
+	// one read per liveHintMinAge.
+	time.Sleep(liveHintMinAge + 50*time.Millisecond)
+	doLiveQuery(h, "HEAD", srv.url(), "sof=900")
+	doLiveQuery(h, "HEAD", srv.url(), "sof=900")
+	doLiveQuery(h, "HEAD", srv.url(), "sof=900")
+	if got := srv.hitCount(playlist); got != reads+2 {
+		t.Fatalf("disagreeing hints back to back: reads=%d, want %d", got, reads+2)
+	}
+	for _, bad := range []string{"sof=-5", "sof=NaN", "sof=abc", "sof=1e99"} {
+		time.Sleep(liveHintMinAge + 50*time.Millisecond)
+		before := srv.hitCount(playlist)
+		doLiveQuery(h, "HEAD", srv.url(), bad)
+		if srv.hitCount(playlist) != before {
+			t.Fatalf("%s is no hint, but it caused a read", bad)
+		}
+	}
+}

@@ -634,3 +634,31 @@ func TestLiveSourceRunStarted(t *testing.T) {
 		t.Fatal("a moved SESSION-OFFSET is a new run and wakes")
 	}
 }
+
+// TestLiveSourceNewRunSeenDespiteSegmentFailure: the run is taken from the
+// playlist header before any segment is fetched. A new run's newest segment
+// is the likeliest to fail once, and that must not hide the run for a poll.
+func TestLiveSourceNewRunSeenDespiteSegmentFailure(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ls.RunStarted()
+	first := ls.RunStartedAt()
+	time.Sleep(2 * time.Millisecond)
+	srv.set("#EXTM3U\n#EXT-X-SESSION-OFFSET:600\n#EXTINF:2.0,\ns0-9.vtt?token=T\n", map[string]string{"s0-9.vtt": seg0})
+	srv.failSegmentOnce("s0-9.vtt", 503)
+	if _, err := ls.Refresh(context.Background()); err == nil {
+		t.Fatal("the failing segment must surface as an error")
+	}
+	if ls.CurrentOffset() != 600*time.Second || !ls.RunStartedAt().After(first) {
+		t.Fatalf("the new run is known despite the failed segment: offset=%s", ls.CurrentOffset())
+	}
+	select {
+	case <-ls.RunStarted():
+	default:
+		t.Fatal("and it wakes the job")
+	}
+}

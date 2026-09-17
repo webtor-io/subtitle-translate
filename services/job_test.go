@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type fakeTranslator struct {
@@ -1059,5 +1061,67 @@ func TestLiveRunnerReusesTranslationsAcrossRunShift(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	if n := atomic.LoadInt32(&tr.calls); n != 0 {
 		t.Fatalf("translated %d batch(es) that were already paid for on the previous run", n)
+	}
+}
+
+// emptyReplyTranslator answers every line with an empty string: a reply that
+// parses, numbered correctly, and says nothing.
+type emptyReplyTranslator struct{}
+
+func (emptyReplyTranslator) Translate(_ context.Context, req BatchRequest) (BatchResult, error) {
+	return BatchResult{Lines: make([]string, len(req.Lines))}, nil
+}
+
+// TestTranslateChunkEmptyReplyKeepsSource: an empty reply line for a cue with
+// text used to be stored as "", which is what "pending" means — so the cue
+// was sent again with every later batch and, on a live source, pinned
+// X-Subtitle-Pending-From to itself for the rest of the run.
+func TestTranslateChunkEmptyReplyKeepsSource(t *testing.T) {
+	r := NewRunner(NewMemoryStore(), emptyReplyTranslator{}, 50, 4, time.Minute)
+	t.Cleanup(r.Close)
+	p := &Progress{Lines: make([]string, 2)}
+	logger := log.NewEntry(log.StandardLogger())
+	if err := r.translateChunk(context.Background(), logger, &Job{Lang: "pt"}, "Portuguese", p, []int{0, 1}, []string{"first", "second"}); err != nil {
+		t.Fatal(err)
+	}
+	if p.Lines[0] != "first" || p.Lines[1] != "second" {
+		t.Fatalf("empty replies must keep the source text: %q", p.Lines)
+	}
+}
+
+// TestLiveRunnerWakeUpsAreSpaced: every read that sees a new run wakes the
+// job, and a playlist whose offset flaps would otherwise have the job reading
+// back to back.
+func TestLiveRunnerWakeUpsAreSpaced(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	r, _ := newLiveRunner(t, &fakeTranslator{}, 50, LiveConfig{PollInterval: time.Hour, BatchWait: time.Hour, Idle: time.Minute, FreshRun: -1})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	playlist := "/h/a.mkv~hls/session/" + liveSessionID + "/s0.m3u8"
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	deadline := time.Now().Add(time.Second)
+	for srv.hitCount(playlist) < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	start := srv.hitCount(playlist)
+	testReads := 0
+	for i := 0; i < 10; i++ {
+		off := "600"
+		if i%2 == 1 {
+			off = "0"
+		}
+		srv.set("#EXTM3U\n#EXT-X-SESSION-OFFSET:"+off+"\n#EXTINF:2.0,\ns0-0.vtt?token=T\n", map[string]string{"s0-0.vtt": seg0})
+		if _, err := ls.Refresh(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		testReads++
+		time.Sleep(20 * time.Millisecond)
+	}
+	if jobReads := srv.hitCount(playlist) - start - testReads; jobReads > 2 {
+		t.Fatalf("ten new runs in 200 ms made the job read %d times; wake-ups must be spaced", jobReads)
 	}
 }
