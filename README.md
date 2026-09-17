@@ -115,6 +115,14 @@ a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
   for the session (kept in Redis for 24 h under the same key, reused by cue
   identity on the next session); the next contiguous viewing completes it.
 - After a seek, cues at or after the current position are translated before the backlog behind it.
+- For the first 30 s of a run (the first read of the playlist, or a seek
+  moving `#EXT-X-SESSION-OFFSET`) a partial batch holding a cue the viewer
+  can still meet is translated at once instead of waiting `--live-batch-wait`
+  for company: that is when the viewer is standing on untranslated cues. A
+  new run seen by a viewer's poll also wakes the job immediately rather than
+  on its next `--live-poll-interval` tick. Without these, the first line at a
+  new position waited for a tick, then for the batch window, then for the
+  upstream call.
 - `X-Subtitle-Pending-From` tells a poller whether the *next* cue the viewer
   will actually reach is translated yet — something the done/total counts
   cannot answer, since in live mode there is almost always an untranslated

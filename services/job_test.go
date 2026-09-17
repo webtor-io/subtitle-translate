@@ -524,7 +524,9 @@ func TestLiveRunnerTranslatesAheadOfPlayheadFirstAfterSeek(t *testing.T) {
 	srv := newLivePlaylistServer(t)
 	srv.set(pl1, map[string]string{"s0-0.vtt": vttWith(4)})
 	tr := &fakeTranslator{}
-	r, st := newLiveRunner(t, tr, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute})
+	// FreshRun off: this test is about the order inside one batch, and needs
+	// the run-0 backlog to still be waiting when the seek lands.
+	r, st := newLiveRunner(t, tr, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute, FreshRun: -1})
 	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
 	r.Touch("k")
 	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
@@ -554,6 +556,71 @@ func TestLiveRunnerTranslatesAheadOfPlayheadFirstAfterSeek(t *testing.T) {
 	}
 	if p, _ := st.GetProgress(context.Background(), "k"); p == nil || p.Live || p.Status != statusDone {
 		t.Fatalf("seeked run reaching ENDLIST must record Status=done: %+v", p)
+	}
+}
+
+// TestLiveRunnerFreshRunDoesNotWaitForCompany: right after a run starts
+// (a seek, or the first read) the viewer is standing on the untranslated
+// cues, so a partial batch goes out at once. BatchWait used to come on top
+// of the poll interval and the upstream call there: the first line at a new
+// position arrived 15-20 s after the seek.
+func TestLiveRunnerFreshRunDoesNotWaitForCompany(t *testing.T) {
+	run := func(t *testing.T, cfg LiveConfig) int32 {
+		srv := newLivePlaylistServer(t)
+		srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+		tr := &fakeTranslator{}
+		r, _ := newLiveRunner(t, tr, 50, cfg)
+		ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+		r.Touch("k")
+		r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+		time.Sleep(150 * time.Millisecond)
+		return atomic.LoadInt32(&tr.calls)
+	}
+	base := LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute}
+	if calls := run(t, base); calls != 1 {
+		t.Fatalf("a fresh run's lone cue must be translated at once, got %d upstream calls", calls)
+	}
+	off := base
+	off.FreshRun = -1
+	if calls := run(t, off); calls != 0 {
+		t.Fatalf("control: without FreshRun the lone cue waits for BatchWait, got %d upstream calls", calls)
+	}
+	stale := base
+	stale.FreshRun = time.Nanosecond
+	if calls := run(t, stale); calls != 0 {
+		t.Fatalf("a run older than FreshRun waits for company again, got %d upstream calls", calls)
+	}
+}
+
+// TestLiveRunnerWakesOnNewRun: the job's ticker is its own schedule, but a
+// seek seen by a viewer's poll (the handler refreshes the source) must not
+// wait for it — the job wakes on the new run and translates it.
+func TestLiveRunnerWakesOnNewRun(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	tr := &fakeTranslator{}
+	// A ticker that never fires inside this test: only the wake-up can move
+	// the job.
+	r, _ := newLiveRunner(t, tr, 50, LiveConfig{PollInterval: time.Hour, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	// The handler primes the source before it starts the job.
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+	waitForCalls(t, tr, 1)
+
+	seek := "#EXTM3U\n#EXT-X-SESSION-OFFSET:600\n#EXTINF:2.0,\ns0-0.vtt?token=T\n"
+	srv.set(seek, map[string]string{"s0-0.vtt": "WEBVTT\n\n00:00.000 --> 00:01.000\nseeked line\n"})
+	// A viewer's poll after the seek: the handler's refresh sees the new run.
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitForCalls(t, tr, 2)
+	reqs := tr.requests()
+	if last := reqs[len(reqs)-1]; len(last) != 1 || last[0] != "seeked line" {
+		t.Fatalf("the wake-up must translate the new run's cue, got %v", reqs)
 	}
 }
 
@@ -866,7 +933,9 @@ func TestRunnerLiveJobsDoNotWaitOnTheOfflineSemaphore(t *testing.T) {
 	release := releaser(ft.block)
 	st := NewMemoryStore()
 	r := NewRunner(st, ft, 3, 1, time.Minute) // one offline slot, taken below
-	r.SetLive(LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute})
+	// FreshRun off: the translator is blocked for the offline job, and a
+	// fresh run's first act would be a batch into that same block.
+	r.SetLive(LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute, FreshRun: -1})
 	defer func() { release(); r.Close() }()
 
 	r.Ensure(context.Background(), "offline", &Job{Lang: "pt", Doc: doc})

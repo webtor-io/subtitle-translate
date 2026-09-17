@@ -593,3 +593,44 @@ func TestLiveSourceRetriesASegmentBeforeGivingUp(t *testing.T) {
 		t.Fatal("no segment was skipped, so the run stays contiguous")
 	}
 }
+
+// TestLiveSourceRunStarted pins when a read counts as a new run: the first
+// successful read, and a read whose #EXT-X-SESSION-OFFSET moved. A read of
+// the same run changes neither the timestamp nor the wake-up channel.
+func TestLiveSourceRunStarted(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	if !ls.RunStartedAt().IsZero() {
+		t.Fatal("no run before the first read")
+	}
+	woke := func() bool {
+		select {
+		case <-ls.RunStarted():
+			return true
+		default:
+			return false
+		}
+	}
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first := ls.RunStartedAt()
+	if first.IsZero() || !woke() {
+		t.Fatalf("the first read starts a run and wakes: at=%v", first)
+	}
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !ls.RunStartedAt().Equal(first) || woke() {
+		t.Fatal("a read of the same run is not a new run")
+	}
+	srv.set("#EXTM3U\n#EXT-X-SESSION-OFFSET:600\n#EXTINF:2.0,\ns0-0.vtt?token=T\n", map[string]string{"s0-0.vtt": seg0})
+	time.Sleep(2 * time.Millisecond)
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !ls.RunStartedAt().After(first) || !woke() {
+		t.Fatal("a moved SESSION-OFFSET is a new run and wakes")
+	}
+}

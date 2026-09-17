@@ -91,10 +91,16 @@ type LiveSource struct {
 	// nothing about the current position changed, only the attempt to
 	// confirm it failed.
 	currentOffset time.Duration
+	// runStartedAt is when a read first saw the current run: the first
+	// successful read, or the first one whose #EXT-X-SESSION-OFFSET differs
+	// from the previous. runStarted gets one token at that moment (buffered,
+	// never blocks) so the job can react before its next tick.
+	runStartedAt time.Time
+	runStarted   chan struct{}
 }
 
 func NewLiveSource(playlistURL string, client *http.Client, maxBytes int64, maxCues int) *LiveSource {
-	return &LiveSource{url: playlistURL, client: client, doc: NewLiveDoc(), maxBytes: maxBytes, maxCues: maxCues, seen: map[string]bool{}, fails: map[string]int{}, contiguous: true}
+	return &LiveSource{url: playlistURL, client: client, doc: NewLiveDoc(), maxBytes: maxBytes, maxCues: maxCues, seen: map[string]bool{}, fails: map[string]int{}, contiguous: true, runStarted: make(chan struct{}, 1)}
 }
 
 func (s *LiveSource) Doc() *LiveDoc { return s.doc }
@@ -411,8 +417,31 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 		s.runEnded = false
 	}
 	out.Ended = s.ended
-	s.lastRefresh = time.Now()
+	now := time.Now()
+	if s.lastRefresh.IsZero() || pl.Offset != s.currentOffset {
+		s.runStartedAt = now
+		select {
+		case s.runStarted <- struct{}{}:
+		default:
+		}
+	}
+	s.lastRefresh = now
 	s.currentOffset = pl.Offset
 	s.mu.Unlock()
 	return out, nil
+}
+
+// RunStartedAt is when a read first saw the current run; zero before the
+// first successful read.
+func (s *LiveSource) RunStartedAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runStartedAt
+}
+
+// RunStarted delivers one token each time a read sees a new run. Buffered by
+// one: a job that was busy picks it up on its next select, and several runs
+// seen in between collapse into one wake-up.
+func (s *LiveSource) RunStarted() <-chan struct{} {
+	return s.runStarted
 }

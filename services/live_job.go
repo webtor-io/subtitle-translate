@@ -22,7 +22,20 @@ type LiveConfig struct {
 	// sized for jobs that finish in seconds and hold a whole parsed
 	// document, is the wrong number for it.
 	MaxJobs int
+	// FreshRun is how long after a transcoder run starts (the first read of
+	// the playlist, or a seek moving #EXT-X-SESSION-OFFSET) a partial batch
+	// holding a cue the viewer can meet is translated at once instead of
+	// waiting BatchWait for company. That is the moment the viewer is
+	// standing on untranslated cues: they just seeked, or just pressed
+	// play. BatchWait there came on top of the poll interval and the
+	// upstream call, so the first line at a new position arrived 15-20 s
+	// after the seek. Zero keeps the default; negative turns it off.
+	FreshRun time.Duration
 }
+
+// defaultFreshRun is one seek quantum: the stretch of film a seek lands the
+// viewer in.
+const defaultFreshRun = 30 * time.Second
 
 // SetLive replaces the live loop's timings. A zero field keeps the default.
 // Call it before the first job starts: it rebuilds the live semaphore.
@@ -38,6 +51,9 @@ func (r *Runner) SetLive(cfg LiveConfig) {
 	}
 	if cfg.MaxJobs < 1 {
 		cfg.MaxJobs = 16
+	}
+	if cfg.FreshRun == 0 {
+		cfg.FreshRun = defaultFreshRun
 	}
 	r.live = cfg
 	r.liveSem = make(chan struct{}, cfg.MaxJobs)
@@ -341,6 +357,21 @@ func pendingFrom(doc *Doc, lines []string, current time.Duration) (from time.Dur
 	return from, ok
 }
 
+// freshRunBlocked reports whether the run started less than FreshRun ago and
+// has an untranslated cue the viewer can still meet — the viewer who just
+// seeked or pressed play is looking at it.
+func (r *Runner) freshRunBlocked(src *LiveSource, doc *Doc, lines []string, now time.Time) bool {
+	if r.live.FreshRun < 0 {
+		return false
+	}
+	started := src.RunStartedAt()
+	if started.IsZero() || now.Sub(started) >= r.live.FreshRun {
+		return false
+	}
+	_, ok := pendingFrom(doc, lines, src.CurrentOffset())
+	return ok
+}
+
 // runLive translates a playlist that is still being written. It holds the
 // same lock as run and lives until the playlist ends, the source goes away
 // or nobody is watching any more; the document it translates grows under
@@ -377,6 +408,9 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		// A new run seen by a handler's refresh (a viewer's poll after a
+		// seek) wakes the job at once rather than on its next tick.
+		case <-job.Live.RunStarted():
 		}
 		ref, err := r.pollLive(ctx, job)
 		switch {
@@ -423,9 +457,11 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		}
 		// A full batch is translated at once; a partial one waits for company
 		// until BatchWait, which bounds how long the viewer stares at a gap.
-		// An ended playlist has no company coming, so it never waits.
+		// An ended playlist has no company coming, so it never waits, and
+		// neither does a fresh run with a cue the viewer can meet (see
+		// LiveConfig.FreshRun).
 		batched := false
-		if pending > 0 && (pending >= r.batchSize || now.Sub(firstPendingAt) >= r.live.BatchWait || ref.Ended) {
+		if pending > 0 && (pending >= r.batchSize || now.Sub(firstPendingAt) >= r.live.BatchWait || ref.Ended || r.freshRunBlocked(job.Live, doc, p.Lines, now)) {
 			if r.batchSize > 0 && pending > r.batchSize {
 				idx, texts = idx[:r.batchSize], texts[:r.batchSize]
 			}
