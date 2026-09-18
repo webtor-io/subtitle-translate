@@ -21,6 +21,7 @@ const (
 	flagLiveBatchWait    = "live-batch-wait"
 	flagLiveIdle         = "live-idle"
 	flagLiveMaxJobs      = "live-max-jobs"
+	flagLeadIn           = "lead-in"
 )
 
 func configure(app *cli.App) {
@@ -40,6 +41,7 @@ func configure(app *cli.App) {
 		cli.IntFlag{Name: flagMaxJobs, Usage: "translation jobs running at once in this replica", Value: 4, EnvVar: "SUBTITLE_TRANSLATE_MAX_JOBS"},
 		cli.IntFlag{Name: flagLivePollInterval, Usage: "how often a live HLS subtitle playlist is re-read, seconds", Value: 4, EnvVar: "SUBTITLE_TRANSLATE_LIVE_POLL_INTERVAL"},
 		cli.IntFlag{Name: flagLiveBatchWait, Usage: "longest a pending live cue waits before a batch smaller than --batch-size is sent, seconds", Value: 10, EnvVar: "SUBTITLE_TRANSLATE_LIVE_BATCH_WAIT"},
+		cli.IntFlag{Name: flagLeadIn, Usage: "a job starts its batches this far behind the viewer's position, seconds (the line on screen and the exchange before it); 0 turns it off", Value: 30, EnvVar: "SUBTITLE_TRANSLATE_LEAD_IN"},
 		cli.IntFlag{Name: flagLiveIdle, Usage: "a live job stops when nobody polled its key for this long, seconds", Value: 90, EnvVar: "SUBTITLE_TRANSLATE_LIVE_IDLE"},
 		cli.IntFlag{Name: flagLiveMaxJobs, Usage: "live translation jobs running at once in this replica, bounded separately from --max-jobs", Value: 16, EnvVar: "SUBTITLE_TRANSLATE_LIVE_MAX_JOBS"},
 	)
@@ -64,6 +66,7 @@ func run(c *cli.Context) error {
 		store := services.NewRedisStore(c, rc, s3c)
 		model := tr.Model()
 		runner := services.NewRunner(store, services.Translator(tr), c.Int(flagBatchSize), c.Int(flagMaxJobs), time.Duration(c.Int(flagLockTTL))*time.Second)
+		runner.SetLeadIn(time.Duration(c.Int(flagLeadIn)) * time.Second)
 		runner.SetLive(services.LiveConfig{
 			PollInterval: time.Duration(c.Int(flagLivePollInterval)) * time.Second,
 			BatchWait:    time.Duration(c.Int(flagLiveBatchWait)) * time.Second,

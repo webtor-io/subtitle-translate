@@ -71,8 +71,9 @@ Request parameters:
 - `pos=<seconds>` — the viewer's playhead, in movie time. For a file source
   this is what makes the job position-aware the way a live one is: the
   position is kept per key (best effort, shared across replicas), batches are
-  ordered by the same rule the live loop uses — pending cues at or ahead of
-  the position first, then the backlog — and it is re-read at every batch
+  ordered by the same rule the live loop uses — pending cues from `--lead-in`
+  (30 s) behind the position onward first, then the backlog — and it is
+  re-read at every batch
   boundary, so a seek redirects the job within one batch. A poll carrying
   `pos` is also answered with `X-Subtitle-Pending-From` computed against it,
   by the same function the live path uses. Partial file bodies render like
@@ -172,13 +173,30 @@ a batch of `--batch-size` cues, or fewer once the oldest pending cue has waited
 - A reply line that comes back empty for a cue with text keeps the original
   text, like every other unusable reply: stored as empty it stayed pending
   forever, re-sent with every batch and pinning `X-Subtitle-Pending-From`.
+- A live job works from the **viewer's position** when a poll carries one
+  (`pos`), and from the start of the run (`#EXT-X-SESSION-OFFSET`) when none
+  does. The start of the run is where the viewer is right after a seek and
+  nowhere near them later: someone who turns the translation on eleven
+  minutes into a run would otherwise wait for eleven minutes of backlog to be
+  translated first. The position is stored under the run it was reported in
+  (`<key>@<run offset, ms>`), and only from a poll that is about the current
+  run (`sof` absent or matching, `pos` not before the run start) — so a
+  position left over from before a seek is never read, with no clean-up to
+  get wrong. Both the batch order and `X-Subtitle-Pending-From` use it.
+- **Lead-in** (`--lead-in`, 30 s; both kinds of job). Batches start from cues
+  whose `End` is at or after `position − lead-in`, not from `Start >=
+  position`: the cue on screen right now began before the viewer got there,
+  and with the old rule it and the exchange before it were "behind" and
+  translated last. A batch is ~50 cues; half a minute is a handful of them,
+  in the same upstream call. The frontier stays on the true position.
 - `X-Subtitle-Pending-From` tells a poller whether the *next* cue the viewer
   will actually reach is translated yet — something the done/total counts
   cannot answer, since in live mode there is almost always an untranslated
   backlog behind the transcoder's newest segment, and after a seek the
   untranslated cues may lie behind the playhead (irrelevant) or ahead of it
   (what matters). It is the `Start` of the earliest untranslated cue among
-  those whose `End` is at or after the current `#EXT-X-SESSION-OFFSET`, i.e.
+  those whose `End` is at or after the viewer's position (the current
+  `#EXT-X-SESSION-OFFSET` when no poll reported one), i.e.
   cues already fully behind the playhead are excluded — a job that went
   ahead-first (see above) leaves them pending for a long time, and reporting
   them would keep a "translation is behind" banner up for a passage the
@@ -299,6 +317,7 @@ GLOBAL OPTIONS:
    --max-jobs value                    translation jobs running at once in this replica (default: 4) [$SUBTITLE_TRANSLATE_MAX_JOBS]
    --live-poll-interval value          how often a live HLS subtitle playlist is re-read, seconds (default: 4) [$SUBTITLE_TRANSLATE_LIVE_POLL_INTERVAL]
    --live-batch-wait value             longest a pending live cue waits before a batch smaller than --batch-size is sent, seconds (default: 10) [$SUBTITLE_TRANSLATE_LIVE_BATCH_WAIT]
+   --lead-in value                     a job starts its batches this far behind the viewer's position, seconds; 0 turns it off (default: 30) [$SUBTITLE_TRANSLATE_LEAD_IN]
    --live-idle value                   a live job stops when nobody polled its key for this long, seconds (default: 90) [$SUBTITLE_TRANSLATE_LIVE_IDLE]
    --live-max-jobs value               live translation jobs running at once in this replica, bounded separately from --max-jobs (default: 16) [$SUBTITLE_TRANSLATE_LIVE_MAX_JOBS]
    --help, -h                          show help

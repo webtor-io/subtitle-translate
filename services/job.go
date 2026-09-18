@@ -63,7 +63,10 @@ type Runner struct {
 	store     Store
 	tr        Translator
 	batchSize int
-	lockTTL   time.Duration
+	// leadIn is how far behind the viewer's position a job starts its
+	// batches from (see pendingByTime). SetLeadIn; defaultLeadIn.
+	leadIn  time.Duration
+	lockTTL time.Duration
 	// ctx is the lifetime of every background job: Close cancels it, and
 	// jobs drop out at the next context check instead of outliving the
 	// process's other components.
@@ -91,6 +94,18 @@ type Runner struct {
 	lastSeen map[string]time.Time
 }
 
+// defaultLeadIn: long enough for the line on screen and the exchange it
+// answers, short enough to be a handful of cues in a batch of fifty.
+const defaultLeadIn = 30 * time.Second
+
+// SetLeadIn overrides the lead-in; a negative value turns it off.
+func (r *Runner) SetLeadIn(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	r.leadIn = d
+}
+
 func NewRunner(store Store, tr Translator, batchSize, maxJobs int, lockTTL time.Duration) *Runner {
 	if maxJobs < 1 {
 		maxJobs = 1
@@ -106,6 +121,7 @@ func NewRunner(store Store, tr Translator, batchSize, maxJobs int, lockTTL time.
 		ctx: ctx, cancel: cancel, sem: make(chan struct{}, maxJobs), running: map[string]chan struct{}{},
 		liveSrc: map[string]*LiveSource{}, lastSeen: map[string]time.Time{}}
 	r.SetLive(LiveConfig{})
+	r.leadIn = defaultLeadIn
 	return r
 }
 
@@ -341,7 +357,7 @@ func (r *Runner) run(ctx context.Context, key string, job *Job) {
 			JobErrors.WithLabelValues("store").Inc()
 			pos = 0
 		}
-		idx := pendingByTime(job.Doc, p.Lines, pos)
+		idx := pendingByTime(job.Doc, p.Lines, pos, r.leadIn)
 		if len(idx) == 0 {
 			break
 		}

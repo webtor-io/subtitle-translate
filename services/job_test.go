@@ -393,7 +393,7 @@ func TestPendingByTimeAheadOfPlayheadFirst(t *testing.T) {
 		cue(4, 650, 600*time.Second, "y"),
 	}}
 	lines := make([]string, len(doc.Cues))
-	idx := pendingByTime(doc, lines, 600*time.Second)
+	idx := pendingByTime(doc, lines, 600*time.Second, 0)
 	texts := textsFor(doc, idx)
 	if len(idx) != 5 {
 		t.Fatalf("idx=%v, want all 5 cues pending", idx)
@@ -427,7 +427,7 @@ func TestPendingByTimeAheadOfPlayheadWinsAcrossIngestRuns(t *testing.T) {
 		cue(2, 240, 150*time.Second, "p2"), // ahead of it, same (earlier) ingest run
 	}}
 	lines := make([]string, len(doc.Cues))
-	idx := pendingByTime(doc, lines, 180*time.Second)
+	idx := pendingByTime(doc, lines, 180*time.Second, 0)
 	texts := textsFor(doc, idx)
 	if len(idx) != 3 {
 		t.Fatalf("idx=%v, want all 3 cues pending", idx)
@@ -1170,6 +1170,11 @@ func TestRunnerBatchTranslatesAheadOfPositionFirst(t *testing.T) {
 	ft := &fakeTranslator{block: make(chan struct{})}
 	st := NewMemoryStore()
 	r := NewRunner(st, ft, 1, 4, time.Minute) // one cue per batch
+	// The cues sit a second apart, so any lead-in would pull the ones behind
+	// the viewer into "ahead" and hide the rule under test: the position
+	// decides, and is re-read per batch. TestPendingByTimeLeadIn has the
+	// lead-in.
+	r.SetLeadIn(0)
 	t.Cleanup(r.Close)
 
 	// The viewer is at 2 s when the job starts.
@@ -1231,5 +1236,34 @@ func TestSnapshotIsSparseAndCarriesTheFrontier(t *testing.T) {
 	}
 	if snap.HasPending {
 		t.Fatal("a poll that does not say where the viewer is gets no frontier")
+	}
+}
+
+// TestPendingByTimeLeadIn: the line between "ahead" and "behind" sits
+// leadIn before the position and is tested on a cue's End, so the cue on
+// screen right now and the exchange before it go out in the first batch
+// (owner, 2026-09-18). Anything that ended before that stays behind.
+func TestPendingByTimeLeadIn(t *testing.T) {
+	at := func(i int, start, end float64) Cue {
+		return Cue{Index: i, Start: time.Duration(start * float64(time.Second)), End: time.Duration(end * float64(time.Second)), Lines: []string{"x"}}
+	}
+	doc := &Doc{Cues: []Cue{
+		at(0, 500, 503), // long gone
+		at(1, 565, 569), // ended 31 s ago: just outside
+		at(2, 572, 575), // ended 25 s ago: inside the lead-in
+		at(3, 598, 603), // on screen right now
+		at(4, 610, 612), // next
+	}}
+	lines := make([]string, len(doc.Cues))
+	if got := fmt.Sprint(pendingByTime(doc, lines, 600*time.Second, 30*time.Second)); got != "[2 3 4 0 1]" {
+		t.Fatalf("lead-in 30 s: got %s, want [2 3 4 0 1]", got)
+	}
+	// No lead-in still takes the cue on screen: End, not Start.
+	if got := fmt.Sprint(pendingByTime(doc, lines, 600*time.Second, 0)); got != "[3 4 0 1 2]" {
+		t.Fatalf("no lead-in: got %s, want [3 4 0 1 2]", got)
+	}
+	// A position inside the first half minute does not go negative.
+	if got := fmt.Sprint(pendingByTime(doc, lines, 10*time.Second, 30*time.Second)); got != "[0 1 2 3 4]" {
+		t.Fatalf("near the start: got %s", got)
 	}
 }

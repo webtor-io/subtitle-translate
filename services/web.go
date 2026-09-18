@@ -610,6 +610,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				logger.WithError(rerr).Warn("failed to refresh the live source, serving what is known")
 			}
 		}
+		// The viewer's position in this run, when the poll carries one. It
+		// is kept under the run it belongs to (LivePosKey), and only when
+		// the poll is about the run the source is on: a position sent with
+		// another run's `sof` (the poll that races a seek) describes film
+		// the new run may not even contain. Best effort, like the file
+		// path's PutPos below.
+		if pos, hasPos := parseSecondsParam(r.URL.Query().Get("pos")); hasPos && !disagrees && pos >= src.CurrentOffset() {
+			if err := h.Runner.store.PutPos(ctx, LivePosKey(key, src.CurrentOffset()), pos); err != nil {
+				logger.WithError(err).Debug("failed to store the live viewer position")
+			}
+		}
 		if r.Method == http.MethodHead {
 			// HEAD never starts the job (same contract as the regular
 			// source below): it reports what is known without triggering

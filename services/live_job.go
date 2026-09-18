@@ -103,6 +103,36 @@ func (r *Runner) forgetSeen(key string) {
 	r.seenMu.Unlock()
 }
 
+// LivePosKey is the store key a live viewer's position is kept under: the
+// job key tagged with the run (#EXT-X-SESSION-OFFSET) the position was
+// reported in. The tag is the whole staleness story: after a seek the new
+// run has another offset, so the position left over from the old run --
+// possibly an hour further into the film -- is simply never read, on this
+// replica or the other, with no clean-up to get wrong.
+func LivePosKey(key string, run time.Duration) string {
+	return key + "@" + strconv.FormatInt(run.Milliseconds(), 10)
+}
+
+// liveCurrent is where a live job works from and what its frontier is
+// measured against: the viewer's position in the current run when a poll
+// has reported one, else the start of the run.
+//
+// Until 2026-09-18 it was always the start of the run. That is where the
+// viewer is right after a seek, and nowhere near them later: a viewer who
+// resumed at 15:49, watched to 27:00 and then turned the translation on
+// had eleven minutes of cues -- about 170 -- queued ahead of the line they
+// were listening to, and the player's hold gave up after ten seconds.
+func (r *Runner) liveCurrent(ctx context.Context, key string, src *LiveSource) time.Duration {
+	offset := src.CurrentOffset()
+	pos, ok, err := r.store.GetPos(ctx, LivePosKey(key, offset))
+	if err != nil || !ok || pos < offset {
+		// Best effort, like the file job's position: order is a quality
+		// of service, not correctness.
+		return offset
+	}
+	return pos
+}
+
 // LiveSnapshot renders what is known for a live key: every cue the source
 // has fetched so far, carrying the translations stored for it. Nothing is
 // started here, and unlike Snapshot the counts describe the document as it
@@ -136,7 +166,7 @@ func (r *Runner) LiveSnapshot(ctx context.Context, key string, src *LiveSource) 
 		status = p.Status
 	}
 	offset := src.CurrentOffset()
-	from, hasPending := pendingFrom(doc, lines, offset)
+	from, hasPending := pendingFrom(doc, lines, r.liveCurrent(ctx, key, src))
 	return &Snapshot{
 		Body:             body,
 		Done:             countDoneByIndex(lines, doc),
@@ -321,13 +351,27 @@ func syncLive(p *Progress, doc *Doc) {
 // in fact sit at the new position. A run that resumes at an offset it already covered changes
 // nothing here either: Refresh's `seen` map makes that a no-op, so there is
 // nothing new to reorder.
-func pendingByTime(doc *Doc, lines []string, current time.Duration) []int {
+//
+// leadIn moves the line between "ahead" and "behind" back from current, and
+// the test is on End, not Start (owner, 2026-09-18): with Start >= current
+// the cue on screen right now -- it began before the viewer got here -- and
+// the exchange it answers were "behind", i.e. translated last, so a viewer
+// who turned the translation on read nothing until the next line began, and
+// nothing at all if they stepped back ten seconds. A batch is ~50 cues; half
+// a minute of lead-in is a handful of them, in the same upstream call. The
+// frontier (pendingFrom) stays on the true position: the lead-in is about
+// what to translate first, not about what the viewer is still going to meet.
+func pendingByTime(doc *Doc, lines []string, current, leadIn time.Duration) []int {
+	from := current - leadIn
+	if from < 0 {
+		from = 0
+	}
 	var aheadIdx, behindIdx []int
 	for _, c := range doc.Cues {
 		if len(c.Lines) == 0 || c.Index < 0 || c.Index >= len(lines) || lines[c.Index] != "" {
 			continue
 		}
-		if c.Start >= current {
+		if c.End >= from {
 			aheadIdx = append(aheadIdx, c.Index)
 		} else {
 			behindIdx = append(behindIdx, c.Index)
@@ -491,7 +535,7 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		// the same document, and the handler refreshes the source too.
 		doc := job.Live.Doc().Snapshot()
 		syncLive(p, doc)
-		idx := pendingByTime(doc, p.Lines, job.Live.CurrentOffset())
+		idx := pendingByTime(doc, p.Lines, r.liveCurrent(ctx, key, job.Live), r.leadIn)
 		pending := len(idx)
 		now := time.Now()
 		switch {
@@ -733,7 +777,7 @@ func (r *Runner) LiveProgress(ctx context.Context, key string, src *LiveSource) 
 		st = p.Status
 	}
 	offset := src.CurrentOffset()
-	from, hasPending := pendingFrom(doc, lines, offset)
+	from, hasPending := pendingFrom(doc, lines, r.liveCurrent(ctx, key, src))
 	return LiveHead{
 		Done:             countDoneByIndex(lines, doc),
 		Total:            len(doc.Cues),

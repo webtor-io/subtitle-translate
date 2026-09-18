@@ -1326,7 +1326,7 @@ func TestSyncLiveKeepsDisplacedTranslations(t *testing.T) {
 			t.Fatalf("cue %d: got %q want %q (the record was overwritten)", i, got[i], want[i])
 		}
 	}
-	if idx := pendingByTime(again, got, 0); len(idx) != 0 {
+	if idx := pendingByTime(again, got, 0, 0); len(idx) != 0 {
 		t.Fatalf("%d cues would be translated (and paid for) a second time", len(idx))
 	}
 }
@@ -1529,5 +1529,43 @@ func TestHandlerFilePartialIsSparse(t *testing.T) {
 	rec := do(h, "GET", "/x~tr:pt/movie.vtt?pos=1.2", src.URL)
 	if !strings.Contains(rec.Body.String(), "PT:line 3") {
 		t.Fatalf("final body: %q", rec.Body.String())
+	}
+}
+
+// TestHandlerLiveFrontierFollowsTheViewer: a live job used to work from the
+// start of the transcoder run (#EXT-X-SESSION-OFFSET) whatever the viewer
+// was doing, so one who turned the translation on eleven minutes into a run
+// was told -- correctly, by that measure -- that the translation was behind,
+// and waited for the whole backlog (owner, 2026-09-18). With a position in
+// the poll, the frontier is measured from the viewer: seg0's only cue ends
+// at 63.699 s, so at 100 s there is nothing left for them to meet.
+func TestHandlerLiveFrontierFollowsTheViewer(t *testing.T) {
+	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+
+	// Fixture guard: with no position the cue is pending from the run start.
+	if got := doLive(h, "HEAD", srv.url()).Header().Get("X-Subtitle-Pending-From"); got != "45.107" {
+		t.Fatalf("no position: got %q, want 45.107", got)
+	}
+	// Inside the cue: still on screen, still counted.
+	if got := doLiveQuery(h, "HEAD", srv.url(), "pos=50").Header().Get("X-Subtitle-Pending-From"); got != "45.107" {
+		t.Fatalf("pos=50: got %q, want 45.107", got)
+	}
+	// Past it: the viewer will not meet it in this run.
+	if got := doLiveQuery(h, "HEAD", srv.url(), "pos=100").Header().Get("X-Subtitle-Pending-From"); got != "" {
+		t.Fatalf("pos=100: got %q, want no frontier", got)
+	}
+}
+
+// TestHandlerLivePositionOfAnotherRunIsNotKept: a poll that names another
+// run (`sof`, the one racing a seek) carries a position in film the current
+// run may not contain. It must not move the frontier.
+func TestHandlerLivePositionOfAnotherRunIsNotKept(t *testing.T) {
+	h, srv := newLiveHandlerForTest(t, &fakeTranslator{})
+	srv.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	// pl1 is run 0; the poll says it is watching run 900.
+	doLiveQuery(h, "HEAD", srv.url(), "pos=1000&sof=900")
+	if got := doLive(h, "HEAD", srv.url()).Header().Get("X-Subtitle-Pending-From"); got != "45.107" {
+		t.Fatalf("after a foreign-run position: got %q, want 45.107", got)
 	}
 }
