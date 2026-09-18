@@ -15,16 +15,20 @@ import (
 // cueMatchTolerance is how far apart in movie time two cues with the same
 // text may sit and still be the same cue.
 //
-// The transcoder reports the requested, 30 s-quantized seek as
-// #EXT-X-SESSION-OFFSET, but invokes FFmpeg with input-level -ss plus
-// -noaccurate_seek in copy mode, so the run actually starts at the keyframe
-// at or before that point: cue + offset is short by up to one GOP (48
-// frames, ~2 s at 24 fps) and by a different amount in every run. Measured
-// on the stand (2026-09-16, same MKV, seek 600 vs seek 570): a constant
-// 1.657 s between the two runs' timelines on every shared line. Exact
-// millisecond identity therefore fails across runs, and the cost of that is
-// paid twice — translated twice, then rendered twice as two overlapping
-// near-identical cues.
+// Transcoders from before 2026-09-17 report the requested, 30 s-quantized
+// seek as #EXT-X-SESSION-OFFSET while a copy-mode run actually starts at
+// the keyframe at or before that point (-noaccurate_seek): cue + offset is
+// short by up to one GOP (48 frames, ~2 s at 24 fps) and by a different
+// amount in every run. Measured on the stand (2026-09-16, same MKV, seek
+// 600 vs seek 570): a constant 1.657 s between the two runs' timelines on
+// every shared line. Exact millisecond identity therefore fails across
+// runs, and the cost of that is paid twice — translated twice, then
+// rendered twice as two overlapping near-identical cues.
+//
+// Since 2026-09-17 the transcoder reports the run's real start and the
+// cross-run shift should be ~0: the tolerance is slack for older
+// transcoders and for the probe's own fallback, no longer load-bearing on
+// the current one.
 //
 // 3 s is above the measured shift and above one GOP at every frame rate we
 // transcode, and well below the gap at which a line repeated in dialogue is

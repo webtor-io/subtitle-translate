@@ -33,8 +33,9 @@ type LiveConfig struct {
 	FreshRun time.Duration
 }
 
-// defaultFreshRun is one seek quantum: the stretch of film a seek lands the
-// viewer in.
+// defaultFreshRun is one transcoder seek quantum's worth of wall time
+// after a run starts — the window in which the viewer who caused the run
+// is standing right at its start.
 const defaultFreshRun = 30 * time.Second
 
 // liveWakeMinGap is the least time between two playlist reads the job does
@@ -312,12 +313,12 @@ func syncLive(p *Progress, doc *Doc) {
 // pending cue of an abandoned earlier run ahead of the new position after a
 // seek — there can be hundreds of them — so the cue playing right now waited
 // out the whole backlog before it was even queued. Matching by ingest run
-// instead of position would still misfire — #EXT-X-SESSION-OFFSET is
-// quantized to 30 s, so a seek to 200 s starts a run at offset 180 while
-// cues covering 180-240 s can already sit in the document tagged with an
-// EARLIER run's offset, ingested before the seek while that run was still
-// playing forward — deprioritizing cues that in fact sit at the new
-// position. A run that resumes at an offset it already covered changes
+// instead of position would still misfire — a run starts at or before the
+// requested position (its keyframe; on pre-2026-09-17 transcoders also
+// 30 s-quantized), so cues covering the new neighborhood can already sit
+// in the document tagged with an EARLIER run's offset, ingested before the
+// seek while that run was still playing forward — deprioritizing cues that
+// in fact sit at the new position. A run that resumes at an offset it already covered changes
 // nothing here either: Refresh's `seen` map makes that a no-op, so there is
 // nothing new to reorder.
 func pendingByTime(doc *Doc, lines []string, current time.Duration) []int {

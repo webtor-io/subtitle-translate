@@ -20,12 +20,11 @@ type Cue struct {
 	Lines []string
 	// Run is the #EXT-X-SESSION-OFFSET of the live run this cue came from;
 	// zero for a file source, which has no runs. Diagnostic only — it says
-	// which ingest run produced the cue, not where the cue sits relative to
-	// the playhead: #EXT-X-SESSION-OFFSET is quantized to 30 s, so a run
-	// covering movie time 180-240 s can be tagged with an earlier offset
-	// than a fresh seek landing in that same neighborhood. pendingByTime
-	// prioritizes by Cue.Start against the current offset instead; see its
-	// doc comment.
+	// which ingest run produced the cue, not where the cue sits relative
+	// to the playhead: two runs can cover overlapping movie time (and on
+	// transcoders from before 2026-09-17 the tag was additionally
+	// quantized to 30 s). pendingByTime prioritizes by Cue.Start against
+	// the current offset instead; see its doc comment.
 	Run time.Duration
 }
 

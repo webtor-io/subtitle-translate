@@ -5,9 +5,13 @@ import (
 	"strings"
 )
 
-// PromptVersion is part of the artifact key: changing the prompt
-// invalidates cached translations.
-const PromptVersion = "v1"
+// PromptVersion is part of the artifact key: changing the prompt — or
+// anything else that changes the text we would produce for the same track
+// URL — invalidates cached translations. v2: web-ui reordered translation
+// sources (the sidecar now outranks a hash-matched OpenSubtitles upload,
+// whose text routinely carries injected ads), and the source is not part
+// of the key, so artifacts translated from the old source had to go.
+const PromptVersion = "v2"
 
 func BuildSystemPrompt(targetName string) string {
 	return fmt.Sprintf(`You translate film and TV subtitles into %s.
