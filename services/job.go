@@ -364,7 +364,10 @@ func (r *Runner) run(ctx context.Context, key string, job *Job) {
 		if r.batchSize > 0 && len(idx) > r.batchSize {
 			idx = idx[:r.batchSize]
 		}
-		if !r.runBatch(ctx, key, token, logger.WithField("batch", batch), job, targetName, p, idx, textsFor(job.Doc, idx)) {
+		batchStarted := time.Now()
+		ok := r.runBatch(ctx, key, token, logger.WithField("batch", batch), job, targetName, p, idx, textsFor(job.Doc, idx))
+		BatchSeconds.WithLabelValues("file").Observe(time.Since(batchStarted).Seconds())
+		if !ok {
 			return
 		}
 	}

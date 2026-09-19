@@ -29,6 +29,9 @@ const segmentMaxStrikes = 3
 type Refresh struct {
 	Added int
 	Ended bool
+	// Segments is how many segments this read fetched. They are fetched one
+	// after another, so it is what a slow read is slow by.
+	Segments int
 }
 
 // LiveSource follows one subtitle media playlist of a transcoder session.
@@ -399,6 +402,7 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 		if s.doc.Len() > s.maxCues {
 			return out, ErrSourceTooLarge
 		}
+		out.Segments++
 		s.mu.Lock()
 		s.seen[key] = true
 		s.runSegments++

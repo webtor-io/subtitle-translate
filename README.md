@@ -352,6 +352,23 @@ Served when `--use-prom` is set.
 | `subtitle_translate_job_seconds` | histogram | End-to-end duration of a finished translation job. |
 | `subtitle_translate_live_segments_skipped_total` | counter | Live segments given up on after three consecutive failures. Each one is a hole in the document (and blocks the final artifact for that run), so a steady rate on one film means the transcoder or the proxy in front of it is losing segments. |
 | `subtitle_translate_line_mismatch_total` | counter | Upstream replies whose line count didn't match the batch (retried once, then the original text is kept). |
+| `subtitle_translate_batch_seconds{source}` | histogram | One batch, upstream call plus store write, by `source` (`live`, `file`). What a viewer waits on after a seek, once or twice over. |
+| `subtitle_translate_live_refresh_seconds` | histogram | One read of a live playlist, its new segments included. Segments are fetched one after another. |
+| `subtitle_translate_live_refresh_segments` | histogram | Segments fetched by one such read. |
+
+### What a live job was doing
+
+Two `info` lines make a viewer's wait after a seek readable after the fact (added 2026-09-19, when a
+110 s hold in production could not be told apart from "translated from the start of the film"):
+
+- `live batch` — one per batch: `run` (the `#EXT-X-SESSION-OFFSET` the job believes it is on),
+  `from` and `fromSource` (where it thinks the viewer is, and who said so: `poll` = a position a
+  viewer reported in this run, `run` = the start of the run standing in for one), `firstCue` /
+  `lastCue` (the stretch of film the batch covers, movie seconds), `cues`, `pending`, `seconds`
+  (the call), `runAge`, `ok`.
+- `live read` — for the first read of a run (`newRun`), and for any read slower than 2 s or larger
+  than 25 segments: `run`, `segments`, `cuesAdded`, `seconds`, `ended`. Ordinary reads stay in the
+  histograms.
 
 ## Cost
 

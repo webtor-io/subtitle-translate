@@ -123,14 +123,22 @@ func LivePosKey(key string, run time.Duration) string {
 // had eleven minutes of cues -- about 170 -- queued ahead of the line they
 // were listening to, and the player's hold gave up after ten seconds.
 func (r *Runner) liveCurrent(ctx context.Context, key string, src *LiveSource) time.Duration {
+	current, _ := r.liveCurrentFrom(ctx, key, src)
+	return current
+}
+
+// liveCurrentFrom is liveCurrent with where the answer came from, for the
+// batch log: "poll" is a position a viewer reported in this run, "run" is
+// the start of the run standing in for one.
+func (r *Runner) liveCurrentFrom(ctx context.Context, key string, src *LiveSource) (time.Duration, string) {
 	offset := src.CurrentOffset()
 	pos, ok, err := r.store.GetPos(ctx, LivePosKey(key, offset))
 	if err != nil || !ok || pos < offset {
 		// Best effort, like the file job's position: order is a quality
 		// of service, not correctness.
-		return offset
+		return offset, "run"
 	}
-	return pos
+	return pos, "poll"
 }
 
 // LiveSnapshot renders what is known for a live key: every cue the source
@@ -518,6 +526,8 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 	published := -1
 	lockedAt := time.Now()
 	var lastPoll time.Time
+	var lastOffset time.Duration
+	offsetLogged := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -547,6 +557,22 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		}
 		lastPoll = time.Now()
 		ref, err := r.pollLive(ctx, job)
+		// A read worth a line: the first one of a run (a seek, as this job
+		// sees it), and any read slow or large enough to be what a viewer is
+		// waiting on. The rest -- every few seconds, nothing new -- stay in
+		// the histograms.
+		if took, off := time.Since(lastPoll), job.Live.CurrentOffset(); err == nil &&
+			(!offsetLogged || off != lastOffset || took >= liveReadWorthLogging || ref.Segments >= liveSegmentsWorthLogging) {
+			logger.WithFields(log.Fields{
+				"run":       off.Seconds(),
+				"newRun":    !offsetLogged || off != lastOffset,
+				"segments":  ref.Segments,
+				"cuesAdded": ref.Added,
+				"ended":     ref.Ended,
+				"seconds":   took.Seconds(),
+			}).Info("live read")
+			lastOffset, offsetLogged = off, true
+		}
 		switch {
 		case err == nil:
 		case errors.Is(err, ErrSourceGone):
@@ -586,7 +612,8 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		// the same document, and the handler refreshes the source too.
 		doc := job.Live.Doc().Snapshot()
 		syncLive(p, doc)
-		idx := pendingByTime(doc, p.Lines, r.liveCurrent(ctx, key, job.Live), r.leadIn)
+		current, currentFrom := r.liveCurrentFrom(ctx, key, job.Live)
+		idx := pendingByTime(doc, p.Lines, current, r.leadIn)
 		pending := len(idx)
 		now := time.Now()
 		switch {
@@ -609,7 +636,28 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 			// Live still set. That is the honest state: this job stopped,
 			// but the playlist did not end, and the next request for the key
 			// starts a job that picks the record up where it is.
-			if !r.runBatch(ctx, key, token, logger, job, targetName, p, idx, textsFor(doc, idx)) {
+			batchStarted := time.Now()
+			ok := r.runBatch(ctx, key, token, logger, job, targetName, p, idx, textsFor(doc, idx))
+			took := time.Since(batchStarted)
+			BatchSeconds.WithLabelValues("live").Observe(took.Seconds())
+			// One line per batch, and everything needed to answer "what was
+			// the job doing while the viewer waited": which run it believes
+			// it is on, where it thinks the viewer is and who told it, which
+			// stretch of film it chose, and how long the call took.
+			first, last := cueSpan(doc, idx)
+			logger.WithFields(log.Fields{
+				"run":        job.Live.CurrentOffset().Seconds(),
+				"from":       current.Seconds(),
+				"fromSource": currentFrom,
+				"cues":       len(idx),
+				"pending":    pending,
+				"firstCue":   first.Seconds(),
+				"lastCue":    last.Seconds(),
+				"seconds":    took.Seconds(),
+				"runAge":     time.Since(job.Live.RunStartedAt()).Seconds(),
+				"ok":         ok,
+			}).Info("live batch")
+			if !ok {
 				return
 			}
 			if len(idx) == pending {
@@ -678,7 +726,32 @@ func (r *Runner) keepAlive(ctx context.Context, key, token string, logger *log.E
 func (r *Runner) pollLive(ctx context.Context, job *Job) (Refresh, error) {
 	rctx, cancel := context.WithTimeout(ctx, sourceFetchTimeout)
 	defer cancel()
-	return job.Live.Refresh(rctx)
+	started := time.Now()
+	ref, err := job.Live.Refresh(rctx)
+	LiveRefreshSeconds.Observe(time.Since(started).Seconds())
+	LiveRefreshSegments.Observe(float64(ref.Segments))
+	return ref, err
+}
+
+// What makes one read of the playlist worth a log line of its own.
+const (
+	liveReadWorthLogging     = 2 * time.Second
+	liveSegmentsWorthLogging = 25
+)
+
+// cueSpan is the movie time a batch covers: the earliest start and the
+// latest end among the cues at idx.
+func cueSpan(doc *Doc, idx []int) (first, last time.Duration) {
+	for i, ci := range idx {
+		c := doc.Cues[ci]
+		if i == 0 || c.Start < first {
+			first = c.Start
+		}
+		if c.End > last {
+			last = c.End
+		}
+	}
+	return first, last
 }
 
 // holdLock refreshes the lease once per lockTTL/3 and reports whether this

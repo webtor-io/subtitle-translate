@@ -1361,3 +1361,44 @@ func TestLiveFrontierUnreadRunIsBounded(t *testing.T) {
 		t.Fatal("an ended playlist with nothing ahead: nothing pending")
 	}
 }
+
+// The batch log says which stretch of film a batch covers and who told the
+// job where the viewer is; both are read off these two helpers.
+func TestCueSpanAndWhereTheViewerIs(t *testing.T) {
+	doc := &Doc{Cues: []Cue{
+		{Index: 0, Start: 10 * time.Second, End: 12 * time.Second},
+		{Index: 1, Start: 1500 * time.Second, End: 1503 * time.Second},
+		{Index: 2, Start: 1490 * time.Second, End: 1509 * time.Second},
+	}}
+	first, last := cueSpan(doc, []int{1, 2})
+	if first != 1490*time.Second || last != 1509*time.Second {
+		t.Fatalf("span of cues 1,2 = %s..%s", first, last)
+	}
+	if f, l := cueSpan(doc, nil); f != 0 || l != 0 {
+		t.Fatalf("an empty batch spans nothing, got %s..%s", f, l)
+	}
+
+	srv := newLivePlaylistServer(t)
+	srv.set(pl2, map[string]string{"s0-0.vtt": seg0, "s0-1.vtt": seg1})
+	r, st := newLiveRunner(t, &fakeTranslator{}, 50, LiveConfig{PollInterval: time.Hour, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	ref, err := ls.Refresh(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Segments != 2 {
+		t.Fatalf("the read fetched two segments, reported %d", ref.Segments)
+	}
+	if ref, _ := ls.Refresh(context.Background()); ref.Segments != 0 {
+		t.Fatalf("a read with nothing new fetches nothing, reported %d", ref.Segments)
+	}
+	if _, from := r.liveCurrentFrom(context.Background(), "k", ls); from != "run" {
+		t.Fatalf("no position reported: the run start stands in, got %q", from)
+	}
+	if err := st.PutPos(context.Background(), LivePosKey("k", ls.CurrentOffset()), 50*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if cur, from := r.liveCurrentFrom(context.Background(), "k", ls); from != "poll" || cur != 50*time.Second {
+		t.Fatalf("a reported position: got %s from %q", cur, from)
+	}
+}
