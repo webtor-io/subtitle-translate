@@ -521,9 +521,8 @@ func TestPendingFrom(t *testing.T) {
 // minutes of wait at the new position. Here the run-0 backlog is 4 cues,
 // kept under batchSize and behind an hour-long BatchWait so nothing is
 // translated before the seek; the seek playlist ends the session
-// (#EXT-X-ENDLIST), which flushes everything pending in one batch, and it is
-// that batch's own line order — recorded via fakeTranslator.requests — that
-// pins the fix.
+// (#EXT-X-ENDLIST), which flushes everything pending, and it is the order of
+// the batches — recorded via fakeTranslator.requests — that pins the fix.
 func TestLiveRunnerTranslatesAheadOfPlayheadFirstAfterSeek(t *testing.T) {
 	srv := newLivePlaylistServer(t)
 	srv.set(pl1, map[string]string{"s0-0.vtt": vttWith(4)})
@@ -548,15 +547,19 @@ func TestLiveRunnerTranslatesAheadOfPlayheadFirstAfterSeek(t *testing.T) {
 	srv.set(seek, map[string]string{"s0-0.vtt": "WEBVTT\n\n00:00.000 --> 00:01.000\nseeked line\n"})
 	r.Wait("k")
 
+	// What the viewer can still meet goes first and goes ALONE (2026-09-19):
+	// the first batch after a seek used to be topped up with the backlog,
+	// and the viewer waited for an upstream call fifty cues long that owed
+	// them three. The backlog follows in a batch of its own.
 	reqs := tr.requests()
-	if len(reqs) != 1 {
-		t.Fatalf("want exactly one upstream batch, got %d: %v", len(reqs), reqs)
+	if len(reqs) != 2 {
+		t.Fatalf("want the cue ahead of the viewer, then the backlog: got %d batches: %v", len(reqs), reqs)
 	}
-	if len(reqs[0]) != 5 {
-		t.Fatalf("want all 5 pending cues in the one batch, got %d: %v", len(reqs[0]), reqs[0])
+	if len(reqs[0]) != 1 || reqs[0][0] != "seeked line" {
+		t.Fatalf("the first batch is the cue ahead of the playhead and nothing else, got %v", reqs[0])
 	}
-	if reqs[0][0] != "seeked line" {
-		t.Fatalf("the cue ahead of the playhead must lead the batch, got %v", reqs[0])
+	if len(reqs[1]) != 4 {
+		t.Fatalf("the backlog follows, whole: got %v", reqs[1])
 	}
 	if p, _ := st.GetProgress(context.Background(), "k"); p == nil || p.Live || p.Status != statusDone {
 		t.Fatalf("seeked run reaching ENDLIST must record Status=done: %+v", p)
@@ -1400,5 +1403,105 @@ func TestCueSpanAndWhereTheViewerIs(t *testing.T) {
 	}
 	if cur, from := r.liveCurrentFrom(context.Background(), "k", ls); from != "poll" || cur != 50*time.Second {
 		t.Fatalf("a reported position: got %s from %q", cur, from)
+	}
+}
+
+// slowTranslator holds every call open until it is released or its context
+// is cancelled, the way an upstream call is: it records which it was.
+type slowTranslator struct {
+	mu        sync.Mutex
+	started   [][]string
+	cancelled [][]string
+	release   chan struct{}
+}
+
+func (s *slowTranslator) Translate(ctx context.Context, req BatchRequest) (BatchResult, error) {
+	lines := append([]string(nil), req.Lines...)
+	s.mu.Lock()
+	s.started = append(s.started, lines)
+	s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		s.mu.Lock()
+		s.cancelled = append(s.cancelled, lines)
+		s.mu.Unlock()
+		return BatchResult{}, ctx.Err()
+	case <-s.release:
+	}
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = "PT:" + l
+	}
+	return BatchResult{Lines: out, InputTokens: 1, OutputTokens: 1}, nil
+}
+
+func (s *slowTranslator) snapshot() (started, cancelled [][]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([][]string(nil), s.started...), append([][]string(nil), s.cancelled...)
+}
+
+// TestLiveRunnerDropsABatchOrderedForTheOldRun: a seek while an upstream call
+// is out. The batch in flight was ordered for where the viewer WAS, and they
+// now wait behind it -- measured in production 2026-09-19: 9 s of a 27.7 s
+// call, before the batch that mattered could even start. A viewer's poll
+// makes the handler read the playlist, the new run is seen, and the batch is
+// dropped; the job goes on with the new run instead of stopping.
+func TestLiveRunnerDropsABatchOrderedForTheOldRun(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(pl1+"#EXT-X-ENDLIST\n", map[string]string{"s0-0.vtt": vttWith(4)})
+	tr := &slowTranslator{release: make(chan struct{})}
+	r, _ := newLiveRunner(t, tr, 50, LiveConfig{PollInterval: 10 * time.Millisecond, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	r.Touch("k")
+	r.Ensure(context.Background(), "k", &Job{Lang: "pt", Live: ls})
+
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				started, cancelled := tr.snapshot()
+				t.Fatalf("%s: started=%v cancelled=%v", what, started, cancelled)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitFor("the run-0 batch never went out", func() bool { s, _ := tr.snapshot(); return len(s) == 1 })
+
+	// The seek: a new run far from anything in that batch. The handler's
+	// read (a viewer's poll naming the new run) is what sees it.
+	seek := "#EXTM3U\n#EXT-X-SESSION-OFFSET:1500\n#EXTINF:2.0,\ns0-0.vtt?token=T\n"
+	srv.set(seek, map[string]string{"s0-0.vtt": "WEBVTT\n\n00:00.000 --> 00:01.000\nseeked line\n"})
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor("the batch ordered for the old run was not dropped", func() bool { _, c := tr.snapshot(); return len(c) == 1 })
+	// ...and the job is still alive: the next call is the new run's cue.
+	waitFor("the job did not go on with the new run", func() bool {
+		s, _ := tr.snapshot()
+		return len(s) >= 2 && len(s[1]) == 1 && s[1][0] == "seeked line"
+	})
+	close(tr.release)
+}
+
+// A batch that already serves the new run is left alone: dropping it would
+// throw away exactly the call the viewer is waiting for.
+func TestBatchServesTheNewRun(t *testing.T) {
+	doc := &Doc{Cues: []Cue{
+		{Index: 0, Start: 400 * time.Second, End: 403 * time.Second},
+		{Index: 1, Start: 1490 * time.Second, End: 1493 * time.Second},
+		{Index: 2, Start: 2400 * time.Second, End: 2403 * time.Second},
+	}}
+	lead := 30 * time.Second
+	if batchServes(doc, []int{0}, 1500*time.Second, lead) {
+		t.Fatal("a cue eighteen minutes behind the new run serves nobody there")
+	}
+	if !batchServes(doc, []int{0, 1}, 1500*time.Second, lead) {
+		t.Fatal("a cue inside the lead-in of the new run is what the viewer waits for")
+	}
+	if batchServes(doc, []int{2}, 1500*time.Second, lead) {
+		t.Fatal("a cue fifteen minutes ahead is not what they are waiting for either")
 	}
 }

@@ -356,6 +356,23 @@ Served when `--use-prom` is set.
 | `subtitle_translate_live_refresh_seconds` | histogram | One read of a live playlist, its new segments included. Segments are fetched one after another. |
 | `subtitle_translate_live_refresh_segments` | histogram | Segments fetched by one such read. |
 
+### After a seek
+
+Two rules keep a viewer's wait after a seek to one short upstream call (2026-09-19; before them a
+seek measured 32 s in production, 9 s of it behind a batch ordered for the position the viewer had
+left and 21.6 s on a batch that carried 3 cues from the new position and 47 from the backlog):
+
+- **What the viewer can still meet is sent alone.** A batch is cues ending at or after
+  `position − --lead-in`, up to `--batch-size`; the cues they have already passed are translated
+  only when nothing ahead is pending — which, with the transcoder 20–25× ahead of the viewer, is
+  most of the time. It used to be topped up with the backlog.
+- **A batch ordered for the old run is dropped** when a read of the playlist sees a new run while
+  the call is out — a viewer's poll naming the new run (`sof`) is what triggers that read — unless the
+  batch happens to serve the new run too (`batchServes`: a cue ending at or after
+  `offset − --lead-in` and beginning within five minutes of it). What it had translated stays; the
+  job goes on with the new run. The `live batch` line carries `dropped=true`. Cost: the tokens of
+  one interrupted call per seek.
+
 ### What a live job was doing
 
 Two `info` lines make a viewer's wait after a seek readable after the fact (added 2026-09-19, when a

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -370,6 +371,13 @@ func syncLive(p *Progress, doc *Doc) {
 // frontier (pendingFrom) stays on the true position: the lead-in is about
 // what to translate first, not about what the viewer is still going to meet.
 func pendingByTime(doc *Doc, lines []string, current, leadIn time.Duration) []int {
+	ahead, behind := pendingSplit(doc, lines, current, leadIn)
+	return append(ahead, behind...)
+}
+
+// pendingSplit is pendingByTime before the two halves are joined: what the
+// viewer can still meet, and what they have already passed.
+func pendingSplit(doc *Doc, lines []string, current, leadIn time.Duration) (ahead, behind []int) {
 	from := current - leadIn
 	if from < 0 {
 		from = 0
@@ -385,7 +393,24 @@ func pendingByTime(doc *Doc, lines []string, current, leadIn time.Duration) []in
 			behindIdx = append(behindIdx, c.Index)
 		}
 	}
-	return append(aheadIdx, behindIdx...)
+	return aheadIdx, behindIdx
+}
+
+// liveBatchServesWithin is how far past a new run's start a cue may begin and
+// still count as "what the viewer of that run is waiting for".
+const liveBatchServesWithin = 5 * time.Minute
+
+// batchServes reports whether a batch holds a cue the viewer of a run
+// starting at offset is about to meet: ending at or after offset - leadIn,
+// beginning within liveBatchServesWithin of it.
+func batchServes(doc *Doc, idx []int, offset, leadIn time.Duration) bool {
+	for _, ci := range idx {
+		c := doc.Cues[ci]
+		if c.End >= offset-leadIn && c.Start <= offset+liveBatchServesWithin {
+			return true
+		}
+	}
+	return false
 }
 
 // textsFor joins the source text of exactly the cues a batch will carry.
@@ -613,8 +638,21 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		doc := job.Live.Doc().Snapshot()
 		syncLive(p, doc)
 		current, currentFrom := r.liveCurrentFrom(ctx, key, job.Live)
-		idx := pendingByTime(doc, p.Lines, current, r.leadIn)
-		pending := len(idx)
+		// What the viewer can still meet goes first and goes ALONE. Until
+		// 2026-09-19 a batch was topped up to --batch-size with cues the
+		// viewer had already passed, and the first batch after a seek is
+		// exactly where that hurt: measured in production, the new run had
+		// 3 cues read, the batch carried those and 47 from eight minutes
+		// into a film being watched at the 25th, and the viewer waited
+		// 21.6 s for an upstream call that owed them 2. The backlog is
+		// translated when nothing ahead of the viewer is pending -- which,
+		// with the transcoder 20-25x ahead of them, is most of the time.
+		ahead, behind := pendingSplit(doc, p.Lines, current, r.leadIn)
+		idx := ahead
+		if len(idx) == 0 {
+			idx = behind
+		}
+		pending := len(ahead) + len(behind)
 		now := time.Now()
 		switch {
 		case pending == 0:
@@ -628,8 +666,8 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 		// neither does a fresh run with a cue the viewer can meet (see
 		// LiveConfig.FreshRun).
 		batched := false
-		if pending > 0 && (pending >= r.batchSize || now.Sub(firstPendingAt) >= r.live.BatchWait || ref.Ended || r.freshRunBlocked(job.Live, doc, p.Lines, now)) {
-			if r.batchSize > 0 && pending > r.batchSize {
+		if pending > 0 && (len(idx) >= r.batchSize || now.Sub(firstPendingAt) >= r.live.BatchWait || ref.Ended || r.freshRunBlocked(job.Live, doc, p.Lines, now)) {
+			if r.batchSize > 0 && len(idx) > r.batchSize {
 				idx = idx[:r.batchSize]
 			}
 			// A failed batch (upstream or store) leaves the record with
@@ -637,7 +675,48 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 			// but the playlist did not end, and the next request for the key
 			// starts a job that picks the record up where it is.
 			batchStarted := time.Now()
-			ok := r.runBatch(ctx, key, token, logger, job, targetName, p, idx, textsFor(doc, idx))
+			// A seek while the call is out: a viewer's poll makes the
+			// handler read the playlist, the new run is seen, and this batch
+			// -- ordered for where the viewer WAS -- is what they now wait
+			// behind (9 s of a 27.7 s call in the same measurement). It is
+			// dropped, unless it happens to serve the new run too. What it
+			// had translated stays; the token is put back so the loop wakes
+			// for the new run the moment it is free.
+			bctx, cancelBatch := context.WithCancel(ctx)
+			var retargeted atomic.Bool
+			runAtStart := job.Live.CurrentOffset()
+			watcherDone := make(chan struct{})
+			go func() {
+				defer close(watcherDone)
+				// A token taken here is the loop's wake-up too, so it is put
+				// back on the way out -- not while waiting, or this goroutine
+				// would receive its own token for ever. A token can also be
+				// one left over from before the batch (the first read of the
+				// run, a nudge): then the run has not changed and the wait
+				// goes on.
+				taken := false
+				defer func() {
+					if taken {
+						job.Live.Nudge()
+					}
+				}()
+				for {
+					select {
+					case <-bctx.Done():
+						return
+					case <-job.Live.RunStarted():
+						taken = true
+						if off := job.Live.CurrentOffset(); off != runAtStart && !batchServes(doc, idx, off, r.leadIn) {
+							retargeted.Store(true)
+							cancelBatch()
+							return
+						}
+					}
+				}
+			}()
+			ok := r.runBatch(bctx, key, token, logger, job, targetName, p, idx, textsFor(doc, idx))
+			cancelBatch()
+			<-watcherDone
 			took := time.Since(batchStarted)
 			BatchSeconds.WithLabelValues("live").Observe(took.Seconds())
 			// One line per batch, and everything needed to answer "what was
@@ -656,7 +735,13 @@ func (r *Runner) runLive(ctx context.Context, key, token string, logger *log.Ent
 				"seconds":    took.Seconds(),
 				"runAge":     time.Since(job.Live.RunStartedAt()).Seconds(),
 				"ok":         ok,
+				"dropped":    retargeted.Load(),
 			}).Info("live batch")
+			if !ok && retargeted.Load() && ctx.Err() == nil {
+				// Not a failure: the batch was dropped for a new run.
+				firstPendingAt = time.Time{}
+				continue
+			}
 			if !ok {
 				return
 			}

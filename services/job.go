@@ -402,8 +402,14 @@ func (r *Runner) runBatch(ctx context.Context, key, token string, logger *log.En
 	bctx, cancel := context.WithTimeout(ctx, r.lockTTL)
 	defer cancel()
 	if err := r.translateChunk(bctx, logger, job, targetName, p, idx, texts); err != nil {
-		JobErrors.WithLabelValues("upstream").Inc()
-		logger.WithError(err).Error("upstream failed, stopping")
+		if ctx.Err() != nil {
+			// The caller took the batch back (a live job dropping it for a
+			// new run, or a shutdown): not an upstream failure.
+			logger.WithError(err).Info("batch cancelled")
+		} else {
+			JobErrors.WithLabelValues("upstream").Inc()
+			logger.WithError(err).Error("upstream failed, stopping")
+		}
 		// Keep whatever was translated so a later run resumes from here,
 		// even when the job context is already cancelled (shutdown).
 		sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
