@@ -166,7 +166,7 @@ func (r *Runner) LiveSnapshot(ctx context.Context, key string, src *LiveSource) 
 		status = p.Status
 	}
 	offset := src.CurrentOffset()
-	from, hasPending := pendingFrom(doc, lines, r.liveCurrent(ctx, key, src))
+	from, hasPending := liveFrontier(doc, lines, r.liveCurrent(ctx, key, src), src, time.Now())
 	return &Snapshot{
 		Body:             body,
 		Done:             countDoneByIndex(lines, doc),
@@ -418,6 +418,57 @@ func pendingFrom(doc *Doc, lines []string, current time.Duration) (from time.Dur
 		}
 	}
 	return from, ok
+}
+
+// liveUnreadHold bounds how long an unread run is reported as pending (see
+// liveFrontier). Long enough for a source that is still downloading to
+// produce its first subtitle segment, short enough that a stretch with no
+// dialogue left in it -- the end credits, where no subtitle playlist is ever
+// written and the run never "ends" for this reader -- does not hold a
+// viewer for ever.
+const liveUnreadHold = 2 * time.Minute
+
+// liveFrontier is pendingFrom for a live source, with one more case: a run
+// of which nothing has been read yet.
+//
+// pendingFrom can only speak of cues the document has. Right after a seek
+// it has none for the new position -- the transcoder writes the subtitle
+// playlist when the first subtitle segment closes, which takes the next cue
+// and, on a source that is still downloading, minutes (measured 2026-09-19:
+// a seek to 30:00 of a file cached to 10:00, no playlist a minute in). "No
+// untranslated cue ahead of you" was then reported as "nothing pending",
+// which a player reads as "the translation is ahead of you": it let the
+// film go, without subtitles, under a pill saying "caught up".
+//
+// So while the playlist has not ended, the run is younger than
+// liveUnreadHold, NOTHING has been read from it yet and the document holds
+// no cue at or after the viewer's position -- translated or not, from this
+// run or an earlier one -- the frontier is the position itself: what the
+// viewer is about to hear has not even been read.
+//
+// "Nothing read from this run" is what keeps this apart from the ordinary
+// case of a viewer who has simply got past the last cue a working run has
+// produced (TestHandlerLiveFrontierFollowsTheViewer): there the reader is
+// reading, the transcoder is 20-25x ahead of the viewer, and "nothing
+// ahead" means what it says. The first segment of the run ends the special
+// case for good and pendingFrom speaks for itself.
+func liveFrontier(doc *Doc, lines []string, current time.Duration, src *LiveSource, now time.Time) (time.Duration, bool) {
+	if from, ok := pendingFrom(doc, lines, current); ok {
+		return from, true
+	}
+	if src == nil || src.Ended() {
+		return 0, false
+	}
+	started := src.RunStartedAt()
+	if started.IsZero() || now.Sub(started) >= liveUnreadHold || src.RunSegments() > 0 {
+		return 0, false
+	}
+	for _, c := range doc.Cues {
+		if c.End >= current {
+			return 0, false
+		}
+	}
+	return current, true
 }
 
 // freshRunBlocked reports whether the run started less than FreshRun ago and
@@ -777,7 +828,7 @@ func (r *Runner) LiveProgress(ctx context.Context, key string, src *LiveSource) 
 		st = p.Status
 	}
 	offset := src.CurrentOffset()
-	from, hasPending := pendingFrom(doc, lines, r.liveCurrent(ctx, key, src))
+	from, hasPending := liveFrontier(doc, lines, r.liveCurrent(ctx, key, src), src, time.Now())
 	return LiveHead{
 		Done:             countDoneByIndex(lines, doc),
 		Total:            len(doc.Cues),

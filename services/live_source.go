@@ -101,6 +101,9 @@ type LiveSource struct {
 	runStartedAt time.Time
 	runStarted   chan struct{}
 	offsetSeen   bool
+	// runSegments counts the segments read from the CURRENT run; a new run
+	// starts it over. Zero means the run's playlist has shown nothing yet.
+	runSegments int
 }
 
 func NewLiveSource(playlistURL string, client *http.Client, maxBytes int64, maxCues int) *LiveSource {
@@ -353,6 +356,7 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 	s.mu.Lock()
 	if !s.offsetSeen || pl.Offset != s.currentOffset {
 		s.runStartedAt = time.Now()
+		s.runSegments = 0
 		select {
 		case s.runStarted <- struct{}{}:
 		default:
@@ -397,6 +401,7 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 		}
 		s.mu.Lock()
 		s.seen[key] = true
+		s.runSegments++
 		// A success clears the segment's strikes. Not observable through
 		// Refresh — a segment that succeeded is also marked seen, so it is
 		// never fetched again — but it keeps fails from accumulating an
@@ -439,6 +444,13 @@ func (s *LiveSource) refresh(ctx context.Context) (Refresh, error) {
 
 // RunStartedAt is when a read first saw the current run; zero before the
 // first successful read.
+// RunSegments is how many segments have been read from the current run.
+func (s *LiveSource) RunSegments() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runSegments
+}
+
 func (s *LiveSource) RunStartedAt() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()

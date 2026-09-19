@@ -60,6 +60,19 @@ Response headers:
   - Absent when there is no such cue: everything at or ahead of the current
     position is translated, the response is a finished/final artifact, or
     `X-Source-Url` is not a live playlist at all.
+  - **An unread run is pending from the viewer's position.** Right after a
+    seek the document has no cue for the new position yet: the transcoder
+    writes the subtitle playlist when the first subtitle segment closes,
+    which takes the next cue and, on a source that is still downloading,
+    minutes. While the playlist has not ended, the run is younger than two
+    minutes (`liveUnreadHold`), no segment of it has been read and the
+    document holds no cue at or after the position, the header carries the
+    position itself — "what you are about to hear has not been read", not
+    "nothing pending". The first segment of the run ends the special case; the
+    two-minute bound is for stretches with no dialogue left (end credits),
+    where no subtitle playlist is ever written. Needs a transcoder whose
+    playlist stub carries `#EXT-X-SESSION-OFFSET` (content-transcoder
+    `cdbc680`); without it the new run is not recognised as one.
 - `X-Subtitle-Session-Offset: <seconds>` — on live responses once the playlist
   has been read: the `#EXT-X-SESSION-OFFSET` the answer (and
   `X-Subtitle-Pending-From`) was computed against. A player that has just

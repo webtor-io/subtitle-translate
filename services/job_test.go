@@ -1267,3 +1267,97 @@ func TestPendingByTimeLeadIn(t *testing.T) {
 		t.Fatalf("near the start: got %s", got)
 	}
 }
+
+// stubAt is the transcoder's subtitle playlist while a run has written none
+// yet: no segments, no ENDLIST, the run's offset (content-transcoder tags it
+// since 2026-09-19).
+func stubAt(offset string) string {
+	return "#EXTM3U\n#EXT-X-SESSION-OFFSET:" + offset + "\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n"
+}
+
+// TestLiveProgressReportsAnUnreadRunAsPending: right after a seek the
+// document has nothing for the new position -- the transcoder writes the
+// subtitle playlist when the first segment closes, minutes on a source that
+// is still downloading. "No untranslated cue ahead" used to go out as
+// "nothing pending", and the player let the film go without subtitles under
+// a pill saying "caught up" (owner, 2026-09-19).
+func TestLiveProgressReportsAnUnreadRunAsPending(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(stubAt("1800.000"), nil)
+	r, _ := newLiveRunner(t, &fakeTranslator{}, 50, LiveConfig{PollInterval: time.Hour, BatchWait: time.Hour, Idle: time.Minute})
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	head, err := r.LiveProgress(context.Background(), "k", ls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !head.HasPending || head.PendingFrom != 1800*time.Second {
+		t.Fatalf("an unread run must be pending from where the viewer is: pending=%v from=%s", head.HasPending, head.PendingFrom)
+	}
+	if head.SessionOffset != 1800*time.Second {
+		t.Fatalf("and it must be about the new run: offset=%s", head.SessionOffset)
+	}
+	// The snapshot (GET) agrees with the head.
+	snap, err := r.LiveSnapshot(context.Background(), "k", ls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.HasPending != head.HasPending || snap.PendingFrom != head.PendingFrom {
+		t.Fatalf("GET and HEAD disagree: %v/%s vs %v/%s", snap.HasPending, snap.PendingFrom, head.HasPending, head.PendingFrom)
+	}
+}
+
+// The special case is narrow on purpose: one cue past the position, an
+// ended playlist, or a run older than liveUnreadHold each end it.
+func TestLiveFrontierUnreadRunIsBounded(t *testing.T) {
+	srv := newLivePlaylistServer(t)
+	srv.set(stubAt("1800.000"), nil)
+	ls := NewLiveSource(srv.url(), srv.srv.Client(), 1<<20, 5000)
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	current := 1800 * time.Second
+	empty := &Doc{}
+	if from, ok := liveFrontier(empty, nil, current, ls, now); !ok || from != current {
+		t.Fatalf("fixture: unread run is pending, got %v/%s", ok, from)
+	}
+	// A run that has been unread for too long says nothing any more: the
+	// end credits never produce a subtitle playlist at all.
+	if _, ok := liveFrontier(empty, nil, current, ls, now.Add(liveUnreadHold+time.Second)); ok {
+		t.Fatal("past liveUnreadHold the unread run must stop holding the viewer")
+	}
+	// One cue at or after the position, already translated: the document
+	// speaks for itself, and it says nothing is pending.
+	read := &Doc{Cues: []Cue{{Index: 0, Start: 1805 * time.Second, End: 1808 * time.Second, Lines: []string{"x"}}}}
+	if _, ok := liveFrontier(read, []string{"y"}, current, ls, now); ok {
+		t.Fatal("a translated cue ahead of the viewer: nothing pending")
+	}
+	// Cues only BEHIND the viewer (the run before the seek) do not count as
+	// read for this position.
+	behind := &Doc{Cues: []Cue{{Index: 0, Start: 30 * time.Second, End: 33 * time.Second, Lines: []string{"x"}}}}
+	if from, ok := liveFrontier(behind, []string{"y"}, current, ls, now); !ok || from != current {
+		t.Fatalf("cues behind the viewer say nothing about where they are: %v/%s", ok, from)
+	}
+	// A run that has shown its first segment is a working run: a viewer
+	// past its last cue has nothing ahead, as before.
+	working := newLivePlaylistServer(t)
+	working.set(pl1, map[string]string{"s0-0.vtt": seg0})
+	wls := NewLiveSource(working.url(), working.srv.Client(), 1<<20, 5000)
+	if _, err := wls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := liveFrontier(wls.Doc().Snapshot(), nil, 100*time.Second, wls, now); ok {
+		t.Fatal("a run that is being read, viewer past its last cue: nothing pending")
+	}
+	// An ended playlist has nothing more coming.
+	srv.set(stubAt("1800.000")+"#EXT-X-ENDLIST\n", nil)
+	if _, err := ls.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := liveFrontier(empty, nil, current, ls, now); ok {
+		t.Fatal("an ended playlist with nothing ahead: nothing pending")
+	}
+}
