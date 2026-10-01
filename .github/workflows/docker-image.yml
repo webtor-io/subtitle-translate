@@ -22,6 +22,7 @@ jobs:
           cache: true
       - run: go vet ./...
       - run: go test ./...
+      - run: python3 scripts/negative_controls.py
   docker:
     needs: test
     uses: webtor-io/.github/.github/workflows/docker-multiarch.yml@main

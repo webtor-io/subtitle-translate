@@ -39,6 +39,35 @@ var (
 
 var replyLineRe = regexp.MustCompile(`^\s*(\d+)\s*[:.)]\s*(.*)$`)
 
+type batchCall func(context.Context, string, string, int) ([]string, bool, int64, int64, error)
+
+// Both providers use the same retry and accounting policy. Only malformed
+// numbered lines in a complete response are retried, once; the job runner
+// handles truncation by splitting the batch and treats refusal as terminal.
+func translateBatch(ctx context.Context, req BatchRequest, call batchCall) (BatchResult, error) {
+	var res BatchResult
+	user := BuildUserPrompt(req)
+	const attempts = 2
+	for attempt := 1; ; attempt++ {
+		lines, complete, in, out, err := call(ctx, BuildSystemPrompt(req.TargetName), user, len(req.Lines))
+		res.InputTokens += in
+		res.OutputTokens += out
+		TokensInput.Add(float64(in))
+		TokensOutput.Add(float64(out))
+		if err == nil {
+			res.Lines = lines
+			return res, nil
+		}
+		if errors.Is(err, ErrLineMismatch) {
+			LineMismatch.Inc()
+		}
+		if !errors.Is(err, ErrLineMismatch) || !complete || attempt == attempts {
+			return res, err
+		}
+		user += "\nReminder: output exactly " + strconv.Itoa(len(req.Lines)) + " numbered lines, nothing else.\n"
+	}
+}
+
 // ParseReply accepts "<i>: <text>" lines (also "<i>." and "<i>)"), ignores
 // blank lines and code fences, and requires exactly n lines numbered 1..n.
 func ParseReply(reply string, n int) ([]string, error) {

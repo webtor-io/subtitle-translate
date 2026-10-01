@@ -2,7 +2,6 @@ package services
 
 import (
 	"context"
-	"strconv"
 	"strings"
 	"time"
 
@@ -12,22 +11,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
-
-const (
-	flagAPIKey          = "anthropic-api-key"
-	flagModel           = "model"
-	flagUpstreamTimeout = "upstream-timeout"
-	flagMaxTokens       = "max-tokens"
-)
-
-func RegisterTranslatorFlags(f []cli.Flag) []cli.Flag {
-	return append(f,
-		cli.StringFlag{Name: flagAPIKey, Usage: "upstream model API key; empty disables translation", EnvVar: "ANTHROPIC_API_KEY"},
-		cli.StringFlag{Name: flagModel, Usage: "upstream model id", Value: "claude-haiku-4-5-20251001", EnvVar: "SUBTITLE_TRANSLATE_MODEL"},
-		cli.IntFlag{Name: flagUpstreamTimeout, Usage: "per-batch upstream timeout, seconds", Value: 60, EnvVar: "SUBTITLE_TRANSLATE_UPSTREAM_TIMEOUT"},
-		cli.IntFlag{Name: flagMaxTokens, Usage: "max output tokens per batch", Value: 8192, EnvVar: "SUBTITLE_TRANSLATE_MAX_TOKENS"},
-	)
-}
 
 type AnthropicTranslator struct {
 	cl        anthropic.Client
@@ -47,7 +30,7 @@ func NewAnthropicTranslator(c *cli.Context, opts ...option.RequestOption) *Anthr
 	opts = append([]option.RequestOption{option.WithAPIKey(key)}, opts...)
 	return &AnthropicTranslator{
 		cl:        anthropic.NewClient(opts...),
-		model:     c.String(flagModel),
+		model:     translatorModel(c, defaultAnthropicModel),
 		timeout:   time.Duration(c.Int(flagUpstreamTimeout)) * time.Second,
 		maxTokens: int64(c.Int(flagMaxTokens)),
 	}
@@ -56,30 +39,10 @@ func NewAnthropicTranslator(c *cli.Context, opts ...option.RequestOption) *Anthr
 func (t *AnthropicTranslator) Model() string { return t.model }
 
 func (t *AnthropicTranslator) Translate(ctx context.Context, req BatchRequest) (BatchResult, error) {
-	var res BatchResult
-	user := BuildUserPrompt(req)
-	const attempts = 2
-	for attempt := 1; ; attempt++ {
-		lines, stop, in, out, err := t.call(ctx, BuildSystemPrompt(req.TargetName), user, len(req.Lines))
-		res.InputTokens += in
-		res.OutputTokens += out
-		TokensInput.Add(float64(in))
-		TokensOutput.Add(float64(out))
-		if err == nil {
-			res.Lines = lines
-			return res, nil
-		}
-		if errors.Is(err, ErrLineMismatch) {
-			LineMismatch.Inc()
-		}
-		// Only a line-count mismatch on a complete reply is worth a second
-		// attempt: a truncated or refused reply would come back the same way
-		// for the identical prompt.
-		if !errors.Is(err, ErrLineMismatch) || stop != anthropic.StopReasonEndTurn || attempt == attempts {
-			return res, err
-		}
-		user = user + "\nReminder: output exactly " + strconv.Itoa(len(req.Lines)) + " numbered lines, nothing else.\n"
-	}
+	return translateBatch(ctx, req, func(ctx context.Context, system, user string, n int) ([]string, bool, int64, int64, error) {
+		lines, stop, in, out, err := t.call(ctx, system, user, n)
+		return lines, stop == anthropic.StopReasonEndTurn, in, out, err
+	})
 }
 
 func (t *AnthropicTranslator) call(ctx context.Context, system, user string, n int) ([]string, anthropic.StopReason, int64, int64, error) {

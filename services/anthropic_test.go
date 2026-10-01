@@ -131,3 +131,12 @@ func TestTranslateReportsRefusalWithoutRetrying(t *testing.T) {
 		t.Fatalf("calls=%d want 1", *n)
 	}
 }
+
+func TestTranslateDoesNotRepairNonCompleteReply(t *testing.T) {
+	srv, n, _ := fakeAPIWithStop(t, []string{"1: only"}, "pause_turn")
+	tr := NewAnthropicTranslator(testCtx(t, "k"), option.WithBaseURL(srv.URL))
+	_, err := tr.Translate(context.Background(), BatchRequest{TargetLang: "pt", TargetName: "Portuguese", Lines: []string{"Hi", "Bye"}})
+	if !errors.Is(err, ErrLineMismatch) || *n != 1 {
+		t.Fatalf("err=%v calls=%d", err, *n)
+	}
+}

@@ -59,7 +59,7 @@ func run(c *cli.Context) error {
 		defer prom.Close()
 	}
 	var handler http.Handler = services.NotConfiguredHandler()
-	if tr := services.NewAnthropicTranslator(c); tr != nil {
+	if tr := services.NewTranslator(c); tr != nil {
 		rc := cs.NewRedisClient(c)
 		defer rc.Close()
 		s3c := cs.NewS3Client(c, &http.Client{Timeout: 60 * time.Second})
