@@ -64,6 +64,8 @@ CONTROLS = [
      'res.OutputTokens = out', 'TestOpenAIRetryPolicy/repair$'),
     ('repair-instruction', 'translator.go', 'user += "\\nReminder: output exactly " + strconv.Itoa(len(req.Lines)) + " numbered lines, nothing else.\\n"',
      '_ = strconv.Itoa(len(req.Lines))', 'TestOpenAIRetryPolicy/repair$'),
+    ('source-failure-not-cached', 'web.go', 'Capacity: sourceCacheCapacity})',
+     'Capacity: sourceCacheCapacity, StoreErrors: true})', 'TestDocForLoaderPanicIsErrorAndRetried$'),
 ]
 
 

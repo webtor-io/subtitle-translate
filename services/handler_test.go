@@ -1569,3 +1569,44 @@ func TestHandlerLivePositionOfAnotherRunIsNotKept(t *testing.T) {
 		t.Fatalf("after a foreign-run position: got %q, want 45.107", got)
 	}
 }
+
+type panicRoundTripper struct{ calls atomic.Int32 }
+
+func (p *panicRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	p.calls.Add(1)
+	panic("malformed source")
+}
+
+// A panic in docFor's loader (it runs astisub over bytes from the network)
+// must come back as that poll's error and leave the key loadable. On lazymap
+// before 55fd9cb the panic escaped Get with the entry still running, so every
+// later poll of the key blocked forever.
+func TestDocForLoaderPanicIsErrorAndRetried(t *testing.T) {
+	rt := &panicRoundTripper{}
+	h := &Handler{Client: &http.Client{Transport: rt}, MaxSourceBytes: 1 << 20, MaxCues: 5000}
+	for i := 1; i <= 2; i++ {
+		res := make(chan *clientError, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					res <- &clientError{err: fmt.Errorf("docFor panicked: %v", r)}
+				}
+			}()
+			_, cerr := h.docFor(context.Background(), "k", "http://source.test/a.vtt")
+			res <- cerr
+		}()
+		select {
+		case cerr := <-res:
+			if cerr == nil {
+				t.Errorf("poll %d: a panicking source returned no error", i)
+			} else if cerr.status != http.StatusBadGateway || !strings.Contains(cerr.err.Error(), "malformed source") {
+				t.Errorf("poll %d: want a 502 carrying the panic, got %d: %v", i, cerr.status, cerr.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("poll %d of the same key hung", i)
+		}
+	}
+	if n := rt.calls.Load(); n != 2 {
+		t.Fatalf("source fetched %d times, want 2: a panic must not be cached", n)
+	}
+}
