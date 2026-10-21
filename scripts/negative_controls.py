@@ -66,6 +66,8 @@ CONTROLS = [
      '_ = strconv.Itoa(len(req.Lines))', 'TestOpenAIRetryPolicy/repair$'),
     ('source-failure-not-cached', 'web.go', 'Capacity: sourceCacheCapacity})',
      'Capacity: sourceCacheCapacity, StoreErrors: true})', 'TestDocForLoaderPanicIsErrorAndRetried$'),
+    ('source-panic-stack-logged', 'web.go', 'if errors.As(err, &perr) {',
+     'if errors.As(err, &perr) && false {', 'TestDocForLoaderPanicIsErrorAndRetried$'),
 ]
 
 

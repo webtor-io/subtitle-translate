@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	log "github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 )
 
 func newHandlerForTest(t *testing.T, tr Translator, source string) (*Handler, *httptest.Server) {
@@ -1582,6 +1585,8 @@ func (p *panicRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 // before 55fd9cb the panic escaped Get with the entry still running, so every
 // later poll of the key blocked forever.
 func TestDocForLoaderPanicIsErrorAndRetried(t *testing.T) {
+	logs := logtest.NewGlobal()
+	t.Cleanup(func() { log.StandardLogger().ReplaceHooks(make(log.LevelHooks)) })
 	rt := &panicRoundTripper{}
 	h := &Handler{Client: &http.Client{Transport: rt}, MaxSourceBytes: 1 << 20, MaxCues: 5000}
 	for i := 1; i <= 2; i++ {
@@ -1599,7 +1604,7 @@ func TestDocForLoaderPanicIsErrorAndRetried(t *testing.T) {
 		case cerr := <-res:
 			if cerr == nil {
 				t.Errorf("poll %d: a panicking source returned no error", i)
-			} else if cerr.status != http.StatusBadGateway || !strings.Contains(cerr.err.Error(), "malformed source") {
+			} else if cerr.status != http.StatusBadGateway || cerr.msg != msgUpstreamUnavail || !strings.Contains(cerr.err.Error(), "malformed source") {
 				t.Errorf("poll %d: want a 502 carrying the panic, got %d: %v", i, cerr.status, cerr.err)
 			}
 		case <-time.After(5 * time.Second):
@@ -1608,5 +1613,20 @@ func TestDocForLoaderPanicIsErrorAndRetried(t *testing.T) {
 	}
 	if n := rt.calls.Load(); n != 2 {
 		t.Fatalf("source fetched %d times, want 2: a panic must not be cached", n)
+	}
+	// The client only sees msgUpstreamUnavail; the panic site has to reach
+	// the log, as net/http's stack dump did before lazymap caught the panic.
+	logged := 0
+	for _, e := range logs.AllEntries() {
+		if e.Message != "source fetch panicked" {
+			continue
+		}
+		logged++
+		if st, _ := e.Data["stack"].(string); !strings.Contains(st, "panicRoundTripper") {
+			t.Errorf("panic logged without the panic site in its stack: %q", st)
+		}
+	}
+	if logged != 2 {
+		t.Fatalf("panic logged %d times, want once per poll (2)", logged)
 	}
 }

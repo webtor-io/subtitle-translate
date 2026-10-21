@@ -305,6 +305,13 @@ func (h *Handler) docFor(ctx context.Context, key, sourceURL string) (*Doc, *cli
 		return d, nil
 	})
 	if err != nil {
+		// lazymap returns a panic in the fetch or the parser (astisub on
+		// bytes from the network) as an error; this is the only place its
+		// stack can still be logged.
+		var perr *lazymap.PanicError
+		if errors.As(err, &perr) {
+			log.WithError(err).WithFields(log.Fields{"key": key, "stack": string(perr.Stack)}).Error("source fetch panicked")
+		}
 		var cerr *clientError
 		if errors.As(err, &cerr) {
 			return nil, cerr
