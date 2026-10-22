@@ -1,7 +1,7 @@
 FROM alpine:3.21 AS certs
 RUN apk add --no-cache ca-certificates
 
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /app
 COPY . .
 ENV GOOS=linux CGO_ENABLED=0
