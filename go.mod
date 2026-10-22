@@ -1,6 +1,6 @@
 module github.com/webtor-io/subtitle-translate
 
-go 1.25.0
+go 1.27
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.34.0
